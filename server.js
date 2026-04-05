@@ -1,167 +1,176 @@
-const express = require('express')
-const { Pool } = require('pg')
-const WebSocket = require('ws')
-const { Pool } = require("pg")
+const express = require("express");
+const WebSocket = require("ws");
 
-const app = express()
-app.use(express.static("."))
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const PORT = process.env.PORT || 3000
+/*
+CONFIG
+*/
 
-// Neon database
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-})
+const TICK_LIMIT = 10000;
+const SIGNAL_INTERVAL = 60000; // 1 minute
+const DERIV_WS = "wss://ws.derivws.com/websockets/v3?app_id=1089";
 
-// signal engine
-class Engine {
+/*
+MARKETS TO ANALYZE
+*/
 
-  constructor(){
-    this.buffers={}
-    this.maxTicks=10000
-  }
-
-  addTick(symbol,price){
-
-    if(!this.buffers[symbol]){
-      this.buffers[symbol]=[]
-    }
-
-    const buf=this.buffers[symbol]
-
-    buf.push(price)
-
-    if(buf.length>this.maxTicks){
-      buf.shift()
-    }
-
-  }
-
-  getDigits(buf){
-    return buf.map(p=>Math.floor(p*1000)%10)
-  }
-
-  analyze(symbol){
-
-    const buf=this.buffers[symbol]
-
-    if(!buf || buf.length<500) return null
-
-    const digits=this.getDigits(buf)
-
-    const counts=Array(10).fill(0)
-
-    digits.forEach(d=>counts[d]++)
-
-    const expected=digits.length/10
-
-    let bestDigit=0
-    let bestScore=0
-
-    counts.forEach((c,i)=>{
-
-      const diff=(c-expected)/expected
-
-      if(diff>bestScore){
-        bestScore=diff
-        bestDigit=i
-      }
-
-    })
-
-    const strength=Math.min(Math.round(bestScore*100),100)
-
-    if(strength<20) return null
-
-    return {
-      digit:bestDigit,
-      strength
-    }
-
-  }
-
-}
-
-const engine=new Engine()
-
-const symbols=[
+const markets = [
 "R_10",
 "R_25",
 "R_50",
 "R_75",
-"R_100"
-]
+"R_100",
+"1HZ10V",
+"1HZ25V",
+"1HZ50V",
+"1HZ75V",
+"1HZ100V"
+];
 
-const signals={}
+/*
+STORE TICKS
+*/
 
-// deriv websocket
-const ws=new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
+let tickStorage = {};
+let signals = {};
 
-ws.on("open",()=>{
+markets.forEach(m => {
+    tickStorage[m] = [];
+});
 
-  symbols.forEach(sym=>{
+/*
+CONNECT TO DERIV
+*/
 
-    ws.send(JSON.stringify({
-      ticks:sym,
-      subscribe:1
-    }))
+function connectDeriv(){
 
-  })
+    const ws = new WebSocket(DERIV_WS);
 
-})
+    ws.on("open", () => {
 
-ws.on("message",async data=>{
+        console.log("Connected to Deriv");
 
-  const msg=JSON.parse(data)
+        markets.forEach(symbol => {
 
-  if(!msg.tick) return
+            ws.send(JSON.stringify({
+                ticks: symbol,
+                subscribe: 1
+            }));
 
-  const symbol=msg.tick.symbol
-  const price=msg.tick.quote
+        });
 
-  engine.addTick(symbol,price)
+    });
 
-  const signal=engine.analyze(symbol)
+    ws.on("message", (data) => {
 
-  if(signal){
+        const msg = JSON.parse(data);
 
-    signals[symbol]=signal
+        if(msg.tick){
 
-    try{
+            const symbol = msg.tick.symbol;
+            const price = msg.tick.quote;
 
-      await pool.query(
-        "INSERT INTO signals(symbol,digit,strength,time) VALUES($1,$2,$3,NOW())",
-        [symbol,signal.digit,signal.strength]
-      )
+            const digit = parseInt(price.toString().slice(-1));
 
-    }catch(err){
-      console.log("DB error")
-    }
+            tickStorage[symbol].push(digit);
 
-  }
+            if(tickStorage[symbol].length > TICK_LIMIT){
+                tickStorage[symbol].shift();
+            }
 
-})
+        }
 
-// api routes
-app.get("/",(req,res)=>{
-  res.send("Matches Analyzer Engine Running")
-})
+    });
 
-app.get("/api/signals",(req,res)=>{
-  res.json(signals)
-})
+    ws.on("close", () => {
+        console.log("Deriv disconnected, reconnecting...");
+        setTimeout(connectDeriv, 5000);
+    });
 
-app.get("/api/history",async(req,res)=>{
+}
 
-  const result=await pool.query(
-    "SELECT * FROM signals ORDER BY time DESC LIMIT 50"
-  )
+connectDeriv();
 
-  res.json(result.rows)
+/*
+DIGIT ANALYSIS
+*/
 
-})
+function analyzeDigits(digits){
 
-app.listen(PORT,()=>{
-  console.log("Server running on",PORT)
-})
+    let freq = Array(10).fill(0);
+
+    digits.forEach(d => {
+        freq[d]++;
+    });
+
+    let maxDigit = 0;
+    let maxCount = 0;
+
+    freq.forEach((count, digit) => {
+
+        if(count > maxCount){
+            maxCount = count;
+            maxDigit = digit;
+        }
+
+    });
+
+    const strength = Math.round((maxCount / digits.length) * 100);
+
+    return {
+        digit: maxDigit,
+        strength: strength
+    };
+
+}
+
+/*
+GENERATE SIGNALS
+*/
+
+function generateSignals(){
+
+    markets.forEach(symbol => {
+
+        const digits = tickStorage[symbol];
+
+        if(digits.length < 100) return;
+
+        const result = analyzeDigits(digits);
+
+        signals[symbol] = {
+            symbol: symbol,
+            match_digit: result.digit,
+            strength: result.strength,
+            timestamp: Date.now()
+        };
+
+    });
+
+}
+
+setInterval(generateSignals, SIGNAL_INTERVAL);
+
+/*
+API
+*/
+
+app.get("/signals", (req,res) => {
+
+    res.json(signals);
+
+});
+
+/*
+SERVER
+*/
+
+app.get("/", (req,res)=>{
+    res.send("Deriv Matches Analyzer Running");
+});
+
+app.listen(PORT, () => {
+    console.log("Server running on port " + PORT);
+});
