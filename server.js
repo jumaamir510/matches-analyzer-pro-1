@@ -1,4 +1,4 @@
-const express = require("express")
+app.use(express.static("public"))const express = require("express")
 const WebSocket = require("ws")
 const { Pool } = require("pg")
 
