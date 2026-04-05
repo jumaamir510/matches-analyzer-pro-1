@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Matches Analyzer</title>
+<style>
+
+body{
+font-family:Arial;
+background:#f5f7fb;
+text-align:center;
+}
+
+.card{
+background:white;
+padding:20px;
+margin:20px;
+border-radius:10px;
+box-shadow:0 2px 10px rgba(0,0,0,0.1);
+}
+
+.digit{
+font-size:40px;
+color:#2563eb;
+}
+
+</style>
+</head>
+
+<body>
+
+<h1>Matches Analyzer</h1>
+
+<div id="signals"></div>
+
+<script>
+
+const API="https://matches-analyzer-pro-1.onrender.com/api/signals"
+
+async function loadSignals(){
+
+const res=await fetch(API)
+
+const data=await res.json()
+
+const container=document.getElementById("signals")
+
+container.innerHTML=""
+
+Object.keys(data).forEach(sym=>{
+
+const s=data[sym]
+
+const div=document.createElement("div")
+
+div.className="card"
+
+div.innerHTML=`
+<h2>${sym}</h2>
+<div class="digit">${s.digit}</div>
+<div>Strength: ${s.strength}%</div>
+`
+
+container.appendChild(div)
+
+})
+
+}
+
+setInterval(loadSignals,5000)
+
+loadSignals()
+
+</script>
+
+</body>
+  </html>
