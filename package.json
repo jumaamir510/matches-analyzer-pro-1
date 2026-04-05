@@ -1,6 +1,7 @@
 {
   "name": "matches-analyzer",
   "version": "1.0.0",
+  "description": "Deriv volatility matches analyzer",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
