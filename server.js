@@ -1,8 +1,9 @@
-app.use(express.static("public"))const express = require("express")
+
 const WebSocket = require("ws")
 const { Pool } = require("pg")
 
 const app = express()
+app.use(express.static("."))
 
 const PORT = process.env.PORT || 3000
 
