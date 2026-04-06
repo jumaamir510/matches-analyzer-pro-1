@@ -4,21 +4,14 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
-console.log("Deriv AI Digit Engine starting...")
+console.log("Deriv Stable Signal Engine starting...")
 
-const HISTORY_LIMIT = 10000
-const ENTRY_COOLDOWN = 5
-const TRADE_WINDOW = 5
+const HISTORY_LIMIT = 2000
+const SIGNAL_DURATION = 30000
+const MIN_STRENGTH = 60
+const MIN_DROUGHT = 20
 
-let MIN_DROUGHT = 25
-let MIN_STRENGTH = 60
-
-let stats = {wins:0,losses:0}
-
-let signals = {}
-let openTrades=[]
-
-const symbols=[
+const symbols = [
 "R_10","R_25","R_50","R_75","R_100",
 "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
 ]
@@ -26,176 +19,138 @@ const symbols=[
 const history={}
 const drought={}
 const frequency={}
-const lastSeen={}
 const lastPrice={}
 const lastDigit={}
 
+let activeSignals={}
+
 symbols.forEach(s=>{
-history[s]=[]
-drought[s]=Array(10).fill(0)
-frequency[s]=Array(10).fill(0)
-lastSeen[s]=Array(10).fill(999)
+ history[s]=[]
+ drought[s]=Array(10).fill(0)
+ frequency[s]=Array(10).fill(0)
 })
 
 const ws=new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
 ws.on("open",()=>{
+ console.log("Connected to Deriv")
 
-console.log("Connected to Deriv")
-
-symbols.forEach(symbol=>{
-ws.send(JSON.stringify({ticks:symbol,subscribe:1}))
-})
-
+ symbols.forEach(symbol=>{
+  ws.send(JSON.stringify({
+   ticks:symbol,
+   subscribe:1
+  }))
+ })
 })
 
 ws.on("message",(msg)=>{
 
-const data=JSON.parse(msg)
+ const data=JSON.parse(msg)
+ if(!data.tick) return
 
-if(!data.tick) return
+ const symbol=data.tick.symbol
+ const price=data.tick.quote
+ const digit=parseInt(price.toFixed(2).slice(-1))
 
-const symbol=data.tick.symbol
-const price=data.tick.quote
-const digit=parseInt(price.toFixed(2).slice(-1))
+ lastPrice[symbol]=price
+ lastDigit[symbol]=digit
 
-lastPrice[symbol]=price
-lastDigit[symbol]=digit
+ const h=history[symbol]
 
-const h=history[symbol]
+ h.push(digit)
+ frequency[symbol][digit]++
 
-h.push(digit)
+ if(h.length>HISTORY_LIMIT){
+  const removed=h.shift()
+  frequency[symbol][removed]--
+ }
 
-frequency[symbol][digit]++
+ if(h.length<200) return
 
-if(h.length>HISTORY_LIMIT){
+ for(let i=0;i<10;i++){
+  drought[symbol][i]++
+ }
 
-const removed=h.shift()
-frequency[symbol][removed]--
+ drought[symbol][digit]=0
 
-}
+ if(activeSignals[symbol] && Date.now()<activeSignals[symbol].expiry){
+  return
+ }
 
-if(h.length<200) return
+ let bestDigit=0
+ let bestScore=0
 
-for(let i=0;i<10;i++){
-drought[symbol][i]++
-lastSeen[symbol][i]++
-}
+ for(let i=0;i<10;i++){
 
-drought[symbol][digit]=0
-lastSeen[symbol][digit]=0
+  const droughtScore=drought[symbol][i]
 
-checkOpenTrades(symbol,digit)
+  const freq=frequency[symbol][i]/h.length
 
-let bestDigit=0
-let bestScore=0
+  const rarity=(0.1-freq)*100
 
-for(let i=0;i<10;i++){
+  const score=droughtScore+rarity
 
-const droughtScore=drought[symbol][i]
-const freq=frequency[symbol][i]/h.length
-const rarityScore=(0.1-freq)*100
+  if(score>bestScore){
+   bestScore=score
+   bestDigit=i
+  }
 
-const score=droughtScore+rarityScore
+ }
 
-if(score>bestScore){
+ const strength=Math.min(95,Math.floor(bestScore))
 
-bestScore=score
-bestDigit=i
+ if(strength<MIN_STRENGTH || drought[symbol][bestDigit]<MIN_DROUGHT){
+  return
+ }
 
-}
+ const entryDigit=(bestDigit+3)%10
 
-}
-
-const strength=Math.min(95,Math.floor(bestScore))
-
-const entryDigit=(bestDigit+2)%10
-
-let entry="WAIT"
-
-if(
-strength>=MIN_STRENGTH &&
-drought[symbol][bestDigit]>=MIN_DROUGHT &&
-digit===entryDigit
-){
-
-entry="ENTER"
-
-openTrades.push({
-symbol,
-digit:bestDigit,
-ticksLeft:TRADE_WINDOW
-})
-
-}
-
-signals[symbol]={
-
-symbol,
-price,
-lastDigit:digit,
-matchDigit:bestDigit,
-entryDigit,
-strength,
-entry
-
-}
+ activeSignals[symbol]={
+  symbol,
+  matchDigit:bestDigit,
+  entryDigit,
+  strength,
+  expiry:Date.now()+SIGNAL_DURATION
+ }
 
 })
-
-function checkOpenTrades(symbol,digit){
-
-openTrades.forEach((t,i)=>{
-
-if(t.symbol!==symbol) return
-
-if(digit===t.digit){
-
-stats.wins++
-openTrades.splice(i,1)
-adjustLearning()
-return
-
-}
-
-t.ticksLeft--
-
-if(t.ticksLeft<=0){
-
-stats.losses++
-openTrades.splice(i,1)
-adjustLearning()
-
-}
-
-})
-
-}
-
-function adjustLearning(){
-
-const total=stats.wins+stats.losses
-
-if(total<20) return
-
-const winrate=stats.wins/total
-
-if(winrate<0.5){
-MIN_DROUGHT+=2
-}
-
-if(winrate>0.65){
-MIN_DROUGHT=Math.max(20,MIN_DROUGHT-1)
-}
-
-}
 
 app.get("/signals",(req,res)=>{
 
-res.json({
-signals,
-stats
-})
+ const now=Date.now()
+
+ const results=[]
+
+ Object.keys(lastPrice).forEach(symbol=>{
+
+  const signal=activeSignals[symbol]
+
+  const expires=signal ? Math.max(0,Math.floor((signal.expiry-now)/1000)) : 0
+
+  results.push({
+   symbol,
+   price:lastPrice[symbol],
+   lastDigit:lastDigit[symbol],
+   matchDigit:signal?signal.matchDigit:"-",
+   entryDigit:signal?signal.entryDigit:"-",
+   strength:signal?signal.strength:0,
+   expires
+  })
+
+ })
+
+ let best=null
+
+ results.forEach(r=>{
+  if(!best || r.strength>best.strength){
+   best=r
+  }
+ })
+
+ res.json({
+  markets:results,
+  best:best?best.symbol:null
+ })
 
 })
 
@@ -207,7 +162,7 @@ res.send(`
 
 <head>
 
-<title>Deriv AI Digit Engine</title>
+<title>Deriv Stable Signal Engine</title>
 
 <style>
 
@@ -234,9 +189,13 @@ th{
 background:#1e293b;
 }
 
+.best{
+background:#1e293b;
+font-weight:bold;
+}
+
 .enter{
 color:#22c55e;
-font-weight:bold;
 }
 
 .wait{
@@ -249,7 +208,7 @@ color:#ef4444;
 
 <body>
 
-<h1>DERIV AI DIGIT ENGINE</h1>
+<h1>DERIV STABLE DIGIT ENGINE</h1>
 
 <table id="table">
 
@@ -260,7 +219,7 @@ color:#ef4444;
 <th>Match Digit</th>
 <th>Entry Digit</th>
 <th>Strength</th>
-<th>Status</th>
+<th>Expires</th>
 </tr>
 
 </table>
@@ -269,13 +228,13 @@ color:#ef4444;
 
 async function load(){
 
-const res=await fetch("/signals")
-const data=await res.json()
+ const res=await fetch("/signals")
 
-const table=document.getElementById("table")
+ const data=await res.json()
 
-table.innerHTML=\`
+ const table=document.getElementById("table")
 
+ table.innerHTML=\`
 <tr>
 <th>Market</th>
 <th>Price</th>
@@ -283,32 +242,28 @@ table.innerHTML=\`
 <th>Match Digit</th>
 <th>Entry Digit</th>
 <th>Strength</th>
-<th>Status</th>
-</tr>
+<th>Expires</th>
+</tr>\`
 
-\`
+ data.markets.forEach(m=>{
 
-Object.values(data.signals).forEach(s=>{
+  const best = m.symbol===data.best ? "best" : ""
 
-const status=s.entry==="ENTER"?"enter":"wait"
+  table.innerHTML+=\`
 
-table.innerHTML+=\`
+  <tr class="\${best}">
+  <td>\${m.symbol} \${best?"⭐":""}</td>
+  <td>\${m.price||"-"}</td>
+  <td>\${m.lastDigit||"-"}</td>
+  <td>\${m.matchDigit}</td>
+  <td>\${m.entryDigit}</td>
+  <td>\${m.strength}%</td>
+  <td>\${m.expires}s</td>
+  </tr>
 
-<tr>
+  \`
 
-<td>\${s.symbol}</td>
-<td>\${s.price}</td>
-<td>\${s.lastDigit}</td>
-<td>\${s.matchDigit}</td>
-<td>\${s.entryDigit}</td>
-<td>\${s.strength}%</td>
-<td class="\${status}">\${s.entry}</td>
-
-</tr>
-
-\`
-
-})
+ })
 
 }
 
@@ -328,6 +283,6 @@ setInterval(load,2000)
 
 app.listen(PORT,()=>{
 
-console.log("Server running on port",PORT)
+ console.log("Server running on port",PORT)
 
 })
