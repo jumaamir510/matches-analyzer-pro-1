@@ -4,6 +4,8 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
+console.log("Deriv Matches Analyzer running...")
+
 let signals = {}
 
 const symbols = [
@@ -20,72 +22,84 @@ const symbols = [
 ]
 
 const tickHistory = {}
-
 symbols.forEach(s => tickHistory[s] = [])
 
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
 ws.on("open", () => {
+
  console.log("Connected to Deriv")
 
  symbols.forEach(symbol => {
+
   ws.send(JSON.stringify({
    ticks: symbol,
    subscribe: 1
   }))
+
  })
+
 })
 
 ws.on("message", msg => {
+
  const data = JSON.parse(msg)
 
- if (data.tick) {
+ if (!data.tick) return
 
-  const symbol = data.tick.symbol
-  const price = data.tick.quote
-  const digit = parseInt(price.toString().slice(-1))
+ const symbol = data.tick.symbol
+ const price = data.tick.quote
 
-  const history = tickHistory[symbol]
+ const digit = parseInt(price.toString().slice(-1))
 
-  history.push(digit)
+ const history = tickHistory[symbol]
 
-  if (history.length > 300) history.shift()
+ history.push(digit)
 
-  const counts = Array(10).fill(0)
+ if (history.length > 300) history.shift()
 
-  history.forEach(d => counts[d]++)
+ if (history.length < 30) return
 
-  let minDigit = 0
-  let minCount = counts[0]
+ const counts = Array(10).fill(0)
 
-  for (let i = 1; i < 10; i++) {
-   if (counts[i] < minCount) {
-    minCount = counts[i]
-    minDigit = i
-   }
+ history.forEach(d => counts[d]++)
+
+ let minDigit = 0
+ let minCount = counts[0]
+
+ for (let i = 1; i < 10; i++) {
+
+  if (counts[i] < minCount) {
+
+   minCount = counts[i]
+   minDigit = i
+
   }
 
-  const strength = Math.floor((1 - minCount / history.length) * 100)
-
-  signals[symbol] = {
-   symbol,
-   match_digit: minDigit,
-   strength,
-   timestamp: Date.now()
-  }
  }
+
+ const strength = Math.floor((1 - minCount / history.length) * 100)
+
+ signals[symbol] = {
+  symbol,
+  match_digit: minDigit,
+  strength,
+  timestamp: Date.now()
+ }
+
 })
 
-app.get("/signals", (req,res)=>{
+app.get("/signals",(req,res)=>{
  res.json(signals)
 })
 
-app.get("/", (req,res)=>{
+app.get("/",(req,res)=>{
 
 res.send(`
 <html>
 
 <head>
+
 <title>Deriv Matches Analyzer</title>
 
 <style>
@@ -172,6 +186,7 @@ async function load(){
   <td>\${s.strength}%</td>
   <td class="\${cls}">\${status}</td>
   </tr>\`
+
  })
 
 }
@@ -186,8 +201,11 @@ setInterval(load,3000)
 
 </html>
 `)
+
 })
 
-app.listen(PORT, ()=>{
- console.log("Deriv Matches Analyzer running...")
+app.listen(PORT,()=>{
+
+ console.log("Server running on port",PORT)
+
 })
