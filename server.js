@@ -4,103 +4,109 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
-console.log("Deriv Matches Analyzer running...")
+console.log("Deriv Matches Pro Analyzer starting...")
+
+const SIGNAL_EXPIRY = 20000
+const HISTORY_LIMIT = 300
 
 let signals = {}
 
 const symbols = [
- "R_10",
- "R_25",
- "R_50",
- "R_75",
- "R_100",
- "1HZ10V",
- "1HZ25V",
- "1HZ50V",
- "1HZ75V",
- "1HZ100V"
+"R_10","R_25","R_50","R_75","R_100",
+"1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
 ]
 
-const tickHistory = {}
-symbols.forEach(s => tickHistory[s] = [])
+const history = {}
+const drought = {}
+
+symbols.forEach(s=>{
+ history[s] = []
+ drought[s] = Array(10).fill(0)
+})
 
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
-ws.on("open", () => {
-
+ws.on("open",()=>{
  console.log("Connected to Deriv")
 
- symbols.forEach(symbol => {
-
+ symbols.forEach(symbol=>{
   ws.send(JSON.stringify({
-   ticks: symbol,
-   subscribe: 1
+   ticks:symbol,
+   subscribe:1
   }))
-
  })
-
 })
 
-ws.on("message", msg => {
+ws.on("message",(msg)=>{
 
  const data = JSON.parse(msg)
 
- if (!data.tick) return
+ if(!data.tick) return
 
  const symbol = data.tick.symbol
  const price = data.tick.quote
 
- const digit = parseInt(price.toString().slice(-1))
+ const digit = parseInt(price.toFixed(2).slice(-1))
 
- const history = tickHistory[symbol]
+ const h = history[symbol]
 
- history.push(digit)
+ h.push(digit)
 
- if (history.length > 300) history.shift()
+ if(h.length>HISTORY_LIMIT) h.shift()
 
- if (history.length < 30) return
+ if(h.length<40) return
 
- const counts = Array(10).fill(0)
-
- history.forEach(d => counts[d]++)
-
- let minDigit = 0
- let minCount = counts[0]
-
- for (let i = 1; i < 10; i++) {
-
-  if (counts[i] < minCount) {
-
-   minCount = counts[i]
-   minDigit = i
-
-  }
-
+ for(let i=0;i<10;i++){
+  drought[symbol][i]++
  }
 
- const strength = Math.floor((1 - minCount / history.length) * 100)
+ drought[symbol][digit]=0
 
- signals[symbol] = {
+ let bestDigit = 0
+ let longest = drought[symbol][0]
+
+ for(let i=1;i<10;i++){
+  if(drought[symbol][i]>longest){
+   longest=drought[symbol][i]
+   bestDigit=i
+  }
+ }
+
+ const strength = Math.min(95,Math.floor(longest*2))
+
+ signals[symbol]={
   symbol,
-  match_digit: minDigit,
+  digit:bestDigit,
   strength,
-  timestamp: Date.now()
+  drought:longest,
+  expiry:Date.now()+SIGNAL_EXPIRY
  }
 
 })
 
 app.get("/signals",(req,res)=>{
- res.json(signals)
+
+ const now = Date.now()
+
+ const active={}
+
+ Object.values(signals).forEach(s=>{
+  if(s.expiry>now){
+   active[s.symbol]=s
+  }
+ })
+
+ res.json(active)
+
 })
 
 app.get("/",(req,res)=>{
 
 res.send(`
 <html>
-
 <head>
 
-<title>Deriv Matches Analyzer</title>
+<title>Deriv Matches Pro Analyzer</title>
 
 <style>
 
@@ -119,7 +125,7 @@ table{
 margin:auto;
 margin-top:30px;
 border-collapse:collapse;
-width:80%;
+width:85%;
 }
 
 td,th{
@@ -135,13 +141,17 @@ background:#1e293b;
 .medium{color:#facc15}
 .weak{color:#ef4444}
 
+.best{
+background:#1e293b;
+}
+
 </style>
 
 </head>
 
 <body>
 
-<h1>DERIV MATCHES ANALYZER</h1>
+<h1>DERIV MATCHES PRO ANALYZER</h1>
 
 <table id="table">
 
@@ -149,7 +159,8 @@ background:#1e293b;
 <th>Market</th>
 <th>Digit</th>
 <th>Strength</th>
-<th>Status</th>
+<th>Drought</th>
+<th>Expires</th>
 </tr>
 
 </table>
@@ -163,28 +174,42 @@ async function load(){
 
  const table = document.getElementById("table")
 
- table.innerHTML = \`
+ table.innerHTML=\`
 <tr>
 <th>Market</th>
 <th>Digit</th>
 <th>Strength</th>
-<th>Status</th>
+<th>Drought</th>
+<th>Expires</th>
 </tr>\`
+
+ let bestStrength=0
+ let bestSymbol=null
+
+ Object.values(data).forEach(s=>{
+  if(s.strength>bestStrength){
+   bestStrength=s.strength
+   bestSymbol=s.symbol
+  }
+ })
 
  Object.values(data).forEach(s=>{
 
-  let status="WEAK"
-  let cls="weak"
+  let status="weak"
+  if(s.strength>70) status="good"
+  else if(s.strength>50) status="medium"
 
-  if(s.strength>70){status="STRONG";cls="good"}
-  else if(s.strength>50){status="GOOD";cls="medium"}
+  const expire=Math.floor((s.expiry-Date.now())/1000)
+
+  const best = s.symbol===bestSymbol ? "best" : ""
 
   table.innerHTML+=\`
-  <tr>
+  <tr class="\${best}">
   <td>\${s.symbol}</td>
-  <td>\${s.match_digit}</td>
-  <td>\${s.strength}%</td>
-  <td class="\${cls}">\${status}</td>
+  <td>\${s.digit}</td>
+  <td class="\${status}">\${s.strength}%</td>
+  <td>\${s.drought}</td>
+  <td>\${expire}s</td>
   </tr>\`
 
  })
@@ -205,7 +230,5 @@ setInterval(load,3000)
 })
 
 app.listen(PORT,()=>{
-
  console.log("Server running on port",PORT)
-
 })
