@@ -1,176 +1,193 @@
-const express = require("express");
-const WebSocket = require("ws");
+const express = require("express")
+const WebSocket = require("ws")
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+const app = express()
+const PORT = process.env.PORT || 10000
 
-/*
-CONFIG
-*/
+let signals = {}
 
-const TICK_LIMIT = 10000;
-const SIGNAL_INTERVAL = 60000; // 1 minute
-const DERIV_WS = "wss://ws.derivws.com/websockets/v3?app_id=1089";
+const symbols = [
+ "R_10",
+ "R_25",
+ "R_50",
+ "R_75",
+ "R_100",
+ "1HZ10V",
+ "1HZ25V",
+ "1HZ50V",
+ "1HZ75V",
+ "1HZ100V"
+]
 
-/*
-MARKETS TO ANALYZE
-*/
+const tickHistory = {}
 
-const markets = [
-"R_10",
-"R_25",
-"R_50",
-"R_75",
-"R_100",
-"1HZ10V",
-"1HZ25V",
-"1HZ50V",
-"1HZ75V",
-"1HZ100V"
-];
+symbols.forEach(s => tickHistory[s] = [])
 
-/*
-STORE TICKS
-*/
+const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
-let tickStorage = {};
-let signals = {};
+ws.on("open", () => {
+ console.log("Connected to Deriv")
 
-markets.forEach(m => {
-    tickStorage[m] = [];
-});
+ symbols.forEach(symbol => {
+  ws.send(JSON.stringify({
+   ticks: symbol,
+   subscribe: 1
+  }))
+ })
+})
 
-/*
-CONNECT TO DERIV
-*/
+ws.on("message", msg => {
+ const data = JSON.parse(msg)
 
-function connectDeriv(){
+ if (data.tick) {
 
-    const ws = new WebSocket(DERIV_WS);
+  const symbol = data.tick.symbol
+  const price = data.tick.quote
+  const digit = parseInt(price.toString().slice(-1))
 
-    ws.on("open", () => {
+  const history = tickHistory[symbol]
 
-        console.log("Connected to Deriv");
+  history.push(digit)
 
-        markets.forEach(symbol => {
+  if (history.length > 300) history.shift()
 
-            ws.send(JSON.stringify({
-                ticks: symbol,
-                subscribe: 1
-            }));
+  const counts = Array(10).fill(0)
 
-        });
+  history.forEach(d => counts[d]++)
 
-    });
+  let minDigit = 0
+  let minCount = counts[0]
 
-    ws.on("message", (data) => {
+  for (let i = 1; i < 10; i++) {
+   if (counts[i] < minCount) {
+    minCount = counts[i]
+    minDigit = i
+   }
+  }
 
-        const msg = JSON.parse(data);
+  const strength = Math.floor((1 - minCount / history.length) * 100)
 
-        if(msg.tick){
+  signals[symbol] = {
+   symbol,
+   match_digit: minDigit,
+   strength,
+   timestamp: Date.now()
+  }
+ }
+})
 
-            const symbol = msg.tick.symbol;
-            const price = msg.tick.quote;
-
-            const digit = parseInt(price.toString().slice(-1));
-
-            tickStorage[symbol].push(digit);
-
-            if(tickStorage[symbol].length > TICK_LIMIT){
-                tickStorage[symbol].shift();
-            }
-
-        }
-
-    });
-
-    ws.on("close", () => {
-        console.log("Deriv disconnected, reconnecting...");
-        setTimeout(connectDeriv, 5000);
-    });
-
-}
-
-connectDeriv();
-
-/*
-DIGIT ANALYSIS
-*/
-
-function analyzeDigits(digits){
-
-    let freq = Array(10).fill(0);
-
-    digits.forEach(d => {
-        freq[d]++;
-    });
-
-    let maxDigit = 0;
-    let maxCount = 0;
-
-    freq.forEach((count, digit) => {
-
-        if(count > maxCount){
-            maxCount = count;
-            maxDigit = digit;
-        }
-
-    });
-
-    const strength = Math.round((maxCount / digits.length) * 100);
-
-    return {
-        digit: maxDigit,
-        strength: strength
-    };
-
-}
-
-/*
-GENERATE SIGNALS
-*/
-
-function generateSignals(){
-
-    markets.forEach(symbol => {
-
-        const digits = tickStorage[symbol];
-
-        if(digits.length < 100) return;
-
-        const result = analyzeDigits(digits);
-
-        signals[symbol] = {
-            symbol: symbol,
-            match_digit: result.digit,
-            strength: result.strength,
-            timestamp: Date.now()
-        };
-
-    });
-
-}
-
-setInterval(generateSignals, SIGNAL_INTERVAL);
-
-/*
-API
-*/
-
-app.get("/signals", (req,res) => {
-
-    res.json(signals);
-
-});
-
-/*
-SERVER
-*/
+app.get("/signals", (req,res)=>{
+ res.json(signals)
+})
 
 app.get("/", (req,res)=>{
-    res.send("Deriv Matches Analyzer Running");
-});
 
-app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
-});
+res.send(`
+<html>
+
+<head>
+<title>Deriv Matches Analyzer</title>
+
+<style>
+
+body{
+background:#0f172a;
+color:white;
+font-family:Arial;
+text-align:center;
+}
+
+h1{
+margin-top:30px;
+}
+
+table{
+margin:auto;
+margin-top:30px;
+border-collapse:collapse;
+width:80%;
+}
+
+td,th{
+border:1px solid #334155;
+padding:10px;
+}
+
+th{
+background:#1e293b;
+}
+
+.good{color:#22c55e}
+.medium{color:#facc15}
+.weak{color:#ef4444}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>DERIV MATCHES ANALYZER</h1>
+
+<table id="table">
+
+<tr>
+<th>Market</th>
+<th>Digit</th>
+<th>Strength</th>
+<th>Status</th>
+</tr>
+
+</table>
+
+<script>
+
+async function load(){
+
+ const res = await fetch("/signals")
+ const data = await res.json()
+
+ const table = document.getElementById("table")
+
+ table.innerHTML = \`
+<tr>
+<th>Market</th>
+<th>Digit</th>
+<th>Strength</th>
+<th>Status</th>
+</tr>\`
+
+ Object.values(data).forEach(s=>{
+
+  let status="WEAK"
+  let cls="weak"
+
+  if(s.strength>70){status="STRONG";cls="good"}
+  else if(s.strength>50){status="GOOD";cls="medium"}
+
+  table.innerHTML+=\`
+  <tr>
+  <td>\${s.symbol}</td>
+  <td>\${s.match_digit}</td>
+  <td>\${s.strength}%</td>
+  <td class="\${cls}">\${status}</td>
+  </tr>\`
+ })
+
+}
+
+load()
+
+setInterval(load,3000)
+
+</script>
+
+</body>
+
+</html>
+`)
+})
+
+app.listen(PORT, ()=>{
+ console.log("Deriv Matches Analyzer running...")
+})
