@@ -4,7 +4,7 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
-console.log("Deriv Stable Signal Engine starting...")
+console.log("Deriv Transition AI Engine starting...")
 
 const HISTORY_LIMIT = 2000
 const SIGNAL_DURATION = 30000
@@ -19,20 +19,23 @@ const symbols = [
 const history={}
 const drought={}
 const frequency={}
+const transitions={}
 const lastPrice={}
 const lastDigit={}
-
 let activeSignals={}
 
 symbols.forEach(s=>{
  history[s]=[]
  drought[s]=Array(10).fill(0)
  frequency[s]=Array(10).fill(0)
+
+ transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
 })
 
 const ws=new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
 ws.on("open",()=>{
+
  console.log("Connected to Deriv")
 
  symbols.forEach(symbol=>{
@@ -41,6 +44,7 @@ ws.on("open",()=>{
    subscribe:1
   }))
  })
+
 })
 
 ws.on("message",(msg)=>{
@@ -53,16 +57,26 @@ ws.on("message",(msg)=>{
  const digit=parseInt(price.toFixed(2).slice(-1))
 
  lastPrice[symbol]=price
+
+ const prevDigit=lastDigit[symbol]
+
  lastDigit[symbol]=digit
 
  const h=history[symbol]
 
  h.push(digit)
+
  frequency[symbol][digit]++
 
+ if(prevDigit!==undefined){
+  transitions[symbol][prevDigit][digit]++
+ }
+
  if(h.length>HISTORY_LIMIT){
+
   const removed=h.shift()
   frequency[symbol][removed]--
+
  }
 
  if(h.length<200) return
@@ -85,10 +99,25 @@ ws.on("message",(msg)=>{
   const droughtScore=drought[symbol][i]
 
   const freq=frequency[symbol][i]/h.length
+  const rarityScore=(0.1-freq)*100
 
-  const rarity=(0.1-freq)*100
+  let transitionScore=0
 
-  const score=droughtScore+rarity
+  if(prevDigit!==undefined){
+
+   const totalTransitions=transitions[symbol][prevDigit].reduce((a,b)=>a+b,0)
+
+   if(totalTransitions>20){
+
+    const prob=transitions[symbol][prevDigit][i]/totalTransitions
+
+    transitionScore=prob*50
+
+   }
+
+  }
+
+  const score=droughtScore+rarityScore+transitionScore
 
   if(score>bestScore){
    bestScore=score
@@ -106,11 +135,13 @@ ws.on("message",(msg)=>{
  const entryDigit=(bestDigit+3)%10
 
  activeSignals[symbol]={
+
   symbol,
   matchDigit:bestDigit,
   entryDigit,
   strength,
   expiry:Date.now()+SIGNAL_DURATION
+
  }
 
 })
@@ -128,6 +159,7 @@ app.get("/signals",(req,res)=>{
   const expires=signal ? Math.max(0,Math.floor((signal.expiry-now)/1000)) : 0
 
   results.push({
+
    symbol,
    price:lastPrice[symbol],
    lastDigit:lastDigit[symbol],
@@ -135,6 +167,7 @@ app.get("/signals",(req,res)=>{
    entryDigit:signal?signal.entryDigit:"-",
    strength:signal?signal.strength:0,
    expires
+
   })
 
  })
@@ -148,8 +181,10 @@ app.get("/signals",(req,res)=>{
  })
 
  res.json({
+
   markets:results,
   best:best?best.symbol:null
+
  })
 
 })
@@ -162,7 +197,7 @@ res.send(`
 
 <head>
 
-<title>Deriv Stable Signal Engine</title>
+<title>Deriv Transition AI Engine</title>
 
 <style>
 
@@ -194,21 +229,13 @@ background:#1e293b;
 font-weight:bold;
 }
 
-.enter{
-color:#22c55e;
-}
-
-.wait{
-color:#ef4444;
-}
-
 </style>
 
 </head>
 
 <body>
 
-<h1>DERIV STABLE DIGIT ENGINE</h1>
+<h1>DERIV TRANSITION AI ENGINE</h1>
 
 <table id="table">
 
@@ -235,6 +262,7 @@ async function load(){
  const table=document.getElementById("table")
 
  table.innerHTML=\`
+
 <tr>
 <th>Market</th>
 <th>Price</th>
@@ -243,7 +271,9 @@ async function load(){
 <th>Entry Digit</th>
 <th>Strength</th>
 <th>Expires</th>
-</tr>\`
+</tr>
+
+\`
 
  data.markets.forEach(m=>{
 
@@ -251,17 +281,17 @@ async function load(){
 
   table.innerHTML+=\`
 
-  <tr class="\${best}">
-  <td>\${m.symbol} \${best?"⭐":""}</td>
-  <td>\${m.price||"-"}</td>
-  <td>\${m.lastDigit||"-"}</td>
-  <td>\${m.matchDigit}</td>
-  <td>\${m.entryDigit}</td>
-  <td>\${m.strength}%</td>
-  <td>\${m.expires}s</td>
-  </tr>
+<tr class="\${best}">
+<td>\${m.symbol} \${best?"⭐":""}</td>
+<td>\${m.price||"-"}</td>
+<td>\${m.lastDigit||"-"}</td>
+<td>\${m.matchDigit}</td>
+<td>\${m.entryDigit}</td>
+<td>\${m.strength}%</td>
+<td>\${m.expires}s</td>
+</tr>
 
-  \`
+\`
 
  })
 
