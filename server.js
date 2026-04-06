@@ -4,14 +4,22 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
-console.log("Deriv Matches Pro Analyzer starting...")
+console.log("Deriv Self Learning Analyzer starting...")
 
 const HISTORY_LIMIT = 10000
-const SIGNAL_EXPIRY = 20000
 
-const MIN_DROUGHT = 25
-const MIN_STRENGTH = 60
+let MIN_DROUGHT = 25
+let MIN_STRENGTH = 60
+
 const ENTRY_COOLDOWN = 5
+const TRADE_WINDOW = 5
+
+let stats = {
+wins:0,
+losses:0
+}
+
+let openTrades = []
 
 let signals = {}
 
@@ -35,6 +43,7 @@ symbols.forEach(s=>{
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
 ws.on("open",()=>{
+
  console.log("Connected to Deriv")
 
  symbols.forEach(symbol=>{
@@ -43,6 +52,7 @@ ws.on("open",()=>{
    subscribe:1
   }))
  })
+
 })
 
 ws.on("message",(msg)=>{
@@ -53,7 +63,6 @@ ws.on("message",(msg)=>{
 
  const symbol = data.tick.symbol
  const price = data.tick.quote
-
  const digit = parseInt(price.toFixed(2).slice(-1))
 
  const h = history[symbol]
@@ -79,24 +88,22 @@ ws.on("message",(msg)=>{
  drought[symbol][digit]=0
  lastSeen[symbol][digit]=0
 
+ checkOpenTrades(symbol,digit)
+
  let bestDigit=0
  let bestScore=0
 
  for(let i=0;i<10;i++){
 
   const droughtScore = drought[symbol][i]
-
   const freq = frequency[symbol][i] / h.length
-
   const rarityScore = (0.1 - freq) * 100
 
   const score = droughtScore + rarityScore
 
   if(score>bestScore){
-
    bestScore=score
    bestDigit=i
-
   }
 
  }
@@ -110,167 +117,96 @@ ws.on("message",(msg)=>{
   drought[symbol][bestDigit] >= MIN_DROUGHT &&
   lastSeen[symbol][bestDigit] > ENTRY_COOLDOWN
  ){
-  entry = "ENTER"
+  entry="ENTER"
+
+  openTrades.push({
+   symbol,
+   digit:bestDigit,
+   ticksLeft:TRADE_WINDOW
+  })
+
  }
 
  signals[symbol]={
-
   symbol,
   digit:bestDigit,
   strength,
   drought:drought[symbol][bestDigit],
   freq:(frequency[symbol][bestDigit]/h.length).toFixed(3),
-  entry,
-  expiry:Date.now()+SIGNAL_EXPIRY
-
+  entry
  }
 
 })
 
-app.get("/signals",(req,res)=>{
+function checkOpenTrades(symbol,digit){
 
- const now=Date.now()
+ openTrades.forEach((t,i)=>{
 
- const active={}
+  if(t.symbol!==symbol) return
 
- Object.values(signals).forEach(s=>{
-  if(s.expiry>now){
-   active[s.symbol]=s
+  if(digit===t.digit){
+
+   stats.wins++
+   openTrades.splice(i,1)
+
+   adjustLearning()
+
+   return
   }
+
+  t.ticksLeft--
+
+  if(t.ticksLeft<=0){
+
+   stats.losses++
+   openTrades.splice(i,1)
+
+   adjustLearning()
+
+  }
+
  })
 
- res.json(active)
+}
+
+function adjustLearning(){
+
+ const total = stats.wins + stats.losses
+
+ if(total<20) return
+
+ const winrate = stats.wins/total
+
+ if(winrate<0.50){
+
+  MIN_DROUGHT+=2
+
+ }
+
+ if(winrate>0.65){
+
+  MIN_DROUGHT=Math.max(20,MIN_DROUGHT-1)
+
+ }
+
+}
+
+app.get("/signals",(req,res)=>{
+
+ res.json({
+ signals,
+ stats,
+ settings:{
+  MIN_DROUGHT,
+  MIN_STRENGTH
+ }
+ })
 
 })
 
 app.get("/",(req,res)=>{
 
-res.send(`
-
-<html>
-
-<head>
-
-<title>Deriv Matches Pro Analyzer</title>
-
-<style>
-
-body{
-background:#0f172a;
-color:white;
-font-family:Arial;
-text-align:center;
-}
-
-h1{
-margin-top:30px;
-}
-
-table{
-margin:auto;
-margin-top:30px;
-border-collapse:collapse;
-width:90%;
-}
-
-td,th{
-border:1px solid #334155;
-padding:10px;
-}
-
-th{
-background:#1e293b;
-}
-
-.good{color:#22c55e}
-.medium{color:#facc15}
-.weak{color:#ef4444}
-
-.enter{
-color:#22c55e;
-font-weight:bold;
-}
-
-.wait{
-color:#ef4444;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<h1>DERIV MATCHES PRO ANALYZER</h1>
-
-<table id="table">
-
-<tr>
-<th>Market</th>
-<th>Digit</th>
-<th>Strength</th>
-<th>Drought</th>
-<th>Frequency</th>
-<th>Entry</th>
-</tr>
-
-</table>
-
-<script>
-
-async function load(){
-
- const res = await fetch("/signals")
- const data = await res.json()
-
- const table=document.getElementById("table")
-
- table.innerHTML=\`
-<tr>
-<th>Market</th>
-<th>Digit</th>
-<th>Strength</th>
-<th>Drought</th>
-<th>Frequency</th>
-<th>Entry</th>
-</tr>\`
-
- Object.values(data).forEach(s=>{
-
-  let status="weak"
-
-  if(s.strength>70) status="good"
-  else if(s.strength>50) status="medium"
-
-  const entryClass = s.entry==="ENTER" ? "enter" : "wait"
-
-  table.innerHTML+=\`
-
-  <tr>
-  <td>\${s.symbol}</td>
-  <td>\${s.digit}</td>
-  <td class="\${status}">\${s.strength}%</td>
-  <td>\${s.drought}</td>
-  <td>\${s.freq}</td>
-  <td class="\${entryClass}">\${s.entry}</td>
-  </tr>
-
-  \`
-
- })
-
-}
-
-load()
-setInterval(load,3000)
-
-</script>
-
-</body>
-
-</html>
-
-`)
+res.send("<h1>Deriv Self Learning Analyzer Running</h1>")
 
 })
 
