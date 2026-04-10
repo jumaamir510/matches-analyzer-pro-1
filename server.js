@@ -1,191 +1,172 @@
-const express = require("express")
-const WebSocket = require("ws")
+const express=require("express")
+const WebSocket=require("ws")
 
-const app = express()
-const PORT = process.env.PORT || 10000
+const app=express()
+const PORT=process.env.PORT||10000
 
-console.log("Deriv Transition AI Engine starting...")
-
-const HISTORY_LIMIT = 2000
-const SIGNAL_DURATION = 30000
-const MIN_STRENGTH = 60
-const MIN_DROUGHT = 20
-
-const symbols = [
+const symbols=[
 "R_10","R_25","R_50","R_75","R_100",
 "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
 ]
 
+const HISTORY_LIMIT=10000
+const SIGNAL_TIME=30000
+
 const history={}
+const freq={}
 const drought={}
-const frequency={}
 const transitions={}
 const lastPrice={}
 const lastDigit={}
-let activeSignals={}
+const streak={}
+
+let signals={}
 
 symbols.forEach(s=>{
- history[s]=[]
- drought[s]=Array(10).fill(0)
- frequency[s]=Array(10).fill(0)
-
- transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
+history[s]=[]
+freq[s]=Array(10).fill(0)
+drought[s]=Array(10).fill(0)
+transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
+streak[s]=0
 })
 
 const ws=new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
 ws.on("open",()=>{
 
- console.log("Connected to Deriv")
-
- symbols.forEach(symbol=>{
-  ws.send(JSON.stringify({
-   ticks:symbol,
-   subscribe:1
-  }))
- })
+symbols.forEach(symbol=>{
+ws.send(JSON.stringify({ticks:symbol,subscribe:1}))
+})
 
 })
 
 ws.on("message",(msg)=>{
 
- const data=JSON.parse(msg)
- if(!data.tick) return
+const data=JSON.parse(msg)
+if(!data.tick)return
 
- const symbol=data.tick.symbol
- const price=data.tick.quote
- const digit=parseInt(price.toFixed(2).slice(-1))
+const symbol=data.tick.symbol
+const price=data.tick.quote
+const digit=parseInt(price.toFixed(2).slice(-1))
 
- lastPrice[symbol]=price
+lastPrice[symbol]=price
 
- const prevDigit=lastDigit[symbol]
+const prev=lastDigit[symbol]
+lastDigit[symbol]=digit
 
- lastDigit[symbol]=digit
+const h=history[symbol]
 
- const h=history[symbol]
+h.push(digit)
+freq[symbol][digit]++
 
- h.push(digit)
+if(prev!==undefined){
 
- frequency[symbol][digit]++
+transitions[symbol][prev][digit]++
 
- if(prevDigit!==undefined){
-  transitions[symbol][prevDigit][digit]++
- }
+if(prev===digit)streak[symbol]++
+else streak[symbol]=1
 
- if(h.length>HISTORY_LIMIT){
+}
 
-  const removed=h.shift()
-  frequency[symbol][removed]--
+if(h.length>HISTORY_LIMIT){
 
- }
+const removed=h.shift()
+freq[symbol][removed]--
 
- if(h.length<200) return
+}
 
- for(let i=0;i<10;i++){
-  drought[symbol][i]++
- }
+if(h.length<300)return
 
- drought[symbol][digit]=0
+for(let i=0;i<10;i++)drought[symbol][i]++
+drought[symbol][digit]=0
 
- if(activeSignals[symbol] && Date.now()<activeSignals[symbol].expiry){
-  return
- }
+if(signals[symbol]&&Date.now()<signals[symbol].expiry)return
 
- let bestDigit=0
- let bestScore=0
+let bestDigit=0
+let bestScore=0
 
- for(let i=0;i<10;i++){
+for(let i=0;i<10;i++){
 
-  const droughtScore=drought[symbol][i]
+const droughtScore=drought[symbol][i]
 
-  const freq=frequency[symbol][i]/h.length
-  const rarityScore=(0.1-freq)*100
+const rarity=(0.1-(freq[symbol][i]/h.length))*100
 
-  let transitionScore=0
+let transitionScore=0
 
-  if(prevDigit!==undefined){
+if(prev!==undefined){
 
-   const totalTransitions=transitions[symbol][prevDigit].reduce((a,b)=>a+b,0)
+const total=transitions[symbol][prev].reduce((a,b)=>a+b,0)
 
-   if(totalTransitions>20){
+if(total>50){
 
-    const prob=transitions[symbol][prevDigit][i]/totalTransitions
+const prob=transitions[symbol][prev][i]/total
 
-    transitionScore=prob*50
+transitionScore=prob*80
 
-   }
+}
 
-  }
+}
 
-  const score=droughtScore+rarityScore+transitionScore
+let pressure=0
+if(streak[symbol]>=3&&i===digit)pressure=40
 
-  if(score>bestScore){
-   bestScore=score
-   bestDigit=i
-  }
+const score=droughtScore+rarity+transitionScore+pressure
 
- }
+if(score>bestScore){
 
- const strength=Math.min(95,Math.floor(bestScore))
+bestScore=score
+bestDigit=i
 
- if(strength<MIN_STRENGTH || drought[symbol][bestDigit]<MIN_DROUGHT){
-  return
- }
+}
 
- const entryDigit=(bestDigit+3)%10
+}
 
- activeSignals[symbol]={
+const entry=(bestDigit+4)%10
 
-  symbol,
-  matchDigit:bestDigit,
-  entryDigit,
-  strength,
-  expiry:Date.now()+SIGNAL_DURATION
+signals[symbol]={
 
- }
+match:bestDigit,
+entry:entry,
+strength:Math.min(99,Math.floor(bestScore)),
+expiry:Date.now()+SIGNAL_TIME
+
+}
 
 })
 
 app.get("/signals",(req,res)=>{
 
- const now=Date.now()
+const now=Date.now()
 
- const results=[]
+const markets=[]
 
- Object.keys(lastPrice).forEach(symbol=>{
+Object.keys(lastPrice).forEach(symbol=>{
 
-  const signal=activeSignals[symbol]
+const s=signals[symbol]
 
-  const expires=signal ? Math.max(0,Math.floor((signal.expiry-now)/1000)) : 0
+const expires=s?Math.max(0,Math.floor((s.expiry-now)/1000)):0
 
-  results.push({
+markets.push({
 
-   symbol,
-   price:lastPrice[symbol],
-   lastDigit:lastDigit[symbol],
-   matchDigit:signal?signal.matchDigit:"-",
-   entryDigit:signal?signal.entryDigit:"-",
-   strength:signal?signal.strength:0,
-   expires
+symbol,
+price:lastPrice[symbol],
+digit:lastDigit[symbol],
+match:s?s.match:"-",
+entry:s?s.entry:"-",
+strength:s?s.strength:0,
+expires
 
-  })
+})
 
- })
+})
 
- let best=null
+let best=null
 
- results.forEach(r=>{
-  if(!best || r.strength>best.strength){
-   best=r
-  }
- })
+markets.forEach(m=>{
+if(!best||m.strength>best.strength)best=m
+})
 
- res.json({
-
-  markets:results,
-  best:best?best.symbol:null
-
- })
+res.json({markets,best:best?best.symbol:null})
 
 })
 
@@ -197,36 +178,62 @@ res.send(`
 
 <head>
 
-<title>Deriv Transition AI Engine</title>
+<title>Deriv AI Digit Engine</title>
 
 <style>
 
 body{
 background:#0f172a;
-color:white;
 font-family:Arial;
+color:white;
 text-align:center;
 }
 
-table{
-margin:auto;
-margin-top:40px;
-border-collapse:collapse;
-width:90%;
+.grid{
+display:grid;
+grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+gap:20px;
+padding:20px;
 }
 
-td,th{
-border:1px solid #334155;
-padding:10px;
-}
+.card{
 
-th{
 background:#1e293b;
+border-radius:12px;
+padding:20px;
+box-shadow:0 0 10px #000;
 }
 
 .best{
-background:#1e293b;
+border:2px solid #22c55e;
+box-shadow:0 0 20px #22c55e;
+}
+
+.price{
+font-size:18px;
+margin-bottom:10px;
+}
+
+.market{
+font-size:14px;
+color:#94a3b8;
+margin-bottom:15px;
+}
+
+.match{
+font-size:40px;
 font-weight:bold;
+}
+
+.entry{
+margin-top:5px;
+color:#22c55e;
+}
+
+.timer{
+margin-top:10px;
+font-size:12px;
+color:#fbbf24;
 }
 
 </style>
@@ -235,65 +242,44 @@ font-weight:bold;
 
 <body>
 
-<h1>DERIV TRANSITION AI ENGINE</h1>
+<h1>DERIV AI DIGIT ENGINE</h1>
 
-<table id="table">
-
-<tr>
-<th>Market</th>
-<th>Price</th>
-<th>Last Digit</th>
-<th>Match Digit</th>
-<th>Entry Digit</th>
-<th>Strength</th>
-<th>Expires</th>
-</tr>
-
-</table>
+<div class="grid" id="grid"></div>
 
 <script>
 
 async function load(){
 
- const res=await fetch("/signals")
+const res=await fetch("/signals")
+const data=await res.json()
 
- const data=await res.json()
+const grid=document.getElementById("grid")
 
- const table=document.getElementById("table")
+grid.innerHTML=""
 
- table.innerHTML=\`
+data.markets.forEach(m=>{
 
-<tr>
-<th>Market</th>
-<th>Price</th>
-<th>Last Digit</th>
-<th>Match Digit</th>
-<th>Entry Digit</th>
-<th>Strength</th>
-<th>Expires</th>
-</tr>
+const best=m.symbol===data.best?"card best":"card"
 
-\`
+grid.innerHTML+=\`
 
- data.markets.forEach(m=>{
+<div class="\${best}">
 
-  const best = m.symbol===data.best ? "best" : ""
+<div class="price">\${m.price||"-"}</div>
 
-  table.innerHTML+=\`
+<div class="market">\${m.symbol}</div>
 
-<tr class="\${best}">
-<td>\${m.symbol} \${best?"⭐":""}</td>
-<td>\${m.price||"-"}</td>
-<td>\${m.lastDigit||"-"}</td>
-<td>\${m.matchDigit}</td>
-<td>\${m.entryDigit}</td>
-<td>\${m.strength}%</td>
-<td>\${m.expires}s</td>
-</tr>
+<div class="match">\${m.match}</div>
+
+<div class="entry">entry digit \${m.entry}</div>
+
+<div class="timer">\${m.expires}s</div>
+
+</div>
 
 \`
 
- })
+})
 
 }
 
@@ -313,6 +299,6 @@ setInterval(load,2000)
 
 app.listen(PORT,()=>{
 
- console.log("Server running on port",PORT)
+console.log("AI Digit Engine running on",PORT)
 
 })
