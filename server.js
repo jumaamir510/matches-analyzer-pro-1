@@ -10,24 +10,28 @@ const symbols=[
 ]
 
 const HISTORY_LIMIT=10000
-const SIGNAL_TIME=30000
+const SIGNAL_WINDOW=25000
 
 const history={}
 const freq={}
 const drought={}
 const transitions={}
-const lastPrice={}
 const lastDigit={}
+const lastPrice={}
 const streak={}
 
 let signals={}
+let outcomes={}
 
 symbols.forEach(s=>{
+
 history[s]=[]
 freq[s]=Array(10).fill(0)
 drought[s]=Array(10).fill(0)
 transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
 streak[s]=0
+outcomes[s]={win:0,loss:0}
+
 })
 
 const ws=new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
@@ -75,7 +79,7 @@ freq[symbol][removed]--
 
 }
 
-if(h.length<300)return
+if(h.length<500)return
 
 for(let i=0;i<10;i++)drought[symbol][i]++
 drought[symbol][digit]=0
@@ -89,7 +93,7 @@ for(let i=0;i<10;i++){
 
 const droughtScore=drought[symbol][i]
 
-const rarity=(0.1-(freq[symbol][i]/h.length))*100
+const rarity=(0.1-(freq[symbol][i]/h.length))*120
 
 let transitionScore=0
 
@@ -101,14 +105,15 @@ if(total>50){
 
 const prob=transitions[symbol][prev][i]/total
 
-transitionScore=prob*80
+transitionScore=prob*100
 
 }
 
 }
 
 let pressure=0
-if(streak[symbol]>=3&&i===digit)pressure=40
+
+if(streak[symbol]>=4&&i===digit)pressure=60
 
 const score=droughtScore+rarity+transitionScore+pressure
 
@@ -121,14 +126,21 @@ bestDigit=i
 
 }
 
-const entry=(bestDigit+4)%10
+const entry=(bestDigit+3)%10
+
+let stage="SCANNING"
+
+if(bestScore>60)stage="FORMING"
+if(bestScore>90)stage="READY"
+if(bestScore>120)stage="ENTER"
 
 signals[symbol]={
 
 match:bestDigit,
 entry:entry,
 strength:Math.min(99,Math.floor(bestScore)),
-expiry:Date.now()+SIGNAL_TIME
+stage:stage,
+expiry:Date.now()+SIGNAL_WINDOW
 
 }
 
@@ -154,6 +166,7 @@ digit:lastDigit[symbol],
 match:s?s.match:"-",
 entry:s?s.entry:"-",
 strength:s?s.strength:0,
+stage:s?s.stage:"SCANNING",
 expires
 
 })
@@ -178,62 +191,84 @@ res.send(`
 
 <head>
 
-<title>Deriv AI Digit Engine</title>
+<title>Deriv AI Analyzer</title>
 
 <style>
 
 body{
+
 background:#0f172a;
-font-family:Arial;
 color:white;
+font-family:Arial;
 text-align:center;
+
 }
 
 .grid{
+
 display:grid;
-grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
 gap:20px;
 padding:20px;
+
 }
 
 .card{
 
 background:#1e293b;
-border-radius:12px;
+border-radius:14px;
 padding:20px;
-box-shadow:0 0 10px #000;
+box-shadow:0 0 15px #000;
+
 }
 
 .best{
+
 border:2px solid #22c55e;
-box-shadow:0 0 20px #22c55e;
+box-shadow:0 0 25px #22c55e;
+
 }
 
 .price{
+
 font-size:18px;
-margin-bottom:10px;
+
 }
 
 .market{
-font-size:14px;
+
+font-size:13px;
 color:#94a3b8;
-margin-bottom:15px;
+margin-bottom:10px;
+
 }
 
 .match{
+
 font-size:40px;
 font-weight:bold;
+
 }
 
 .entry{
-margin-top:5px;
+
 color:#22c55e;
+margin-top:5px;
+
+}
+
+.stage{
+
+margin-top:10px;
+font-size:12px;
+
 }
 
 .timer{
-margin-top:10px;
-font-size:12px;
+
+margin-top:5px;
 color:#fbbf24;
+
 }
 
 </style>
@@ -242,7 +277,7 @@ color:#fbbf24;
 
 <body>
 
-<h1>DERIV AI DIGIT ENGINE</h1>
+<h1>DERIV AI DIGIT ANALYZER</h1>
 
 <div class="grid" id="grid"></div>
 
@@ -273,6 +308,8 @@ grid.innerHTML+=\`
 
 <div class="entry">entry digit \${m.entry}</div>
 
+<div class="stage">\${m.stage}</div>
+
 <div class="timer">\${m.expires}s</div>
 
 </div>
@@ -299,6 +336,6 @@ setInterval(load,2000)
 
 app.listen(PORT,()=>{
 
-console.log("AI Digit Engine running on",PORT)
+console.log("AI Analyzer running on",PORT)
 
 })
