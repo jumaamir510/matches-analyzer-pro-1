@@ -10,7 +10,7 @@ const symbols=[
 ]
 
 const HISTORY_LIMIT=10000
-const SIGNAL_WINDOW=25000
+const ENTRY_TICKS=15
 
 const history={}
 const freq={}
@@ -19,9 +19,9 @@ const transitions={}
 const lastDigit={}
 const lastPrice={}
 const streak={}
+const tickWindow={}
 
 let signals={}
-let outcomes={}
 
 symbols.forEach(s=>{
 
@@ -30,7 +30,7 @@ freq[s]=Array(10).fill(0)
 drought[s]=Array(10).fill(0)
 transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
 streak[s]=0
-outcomes[s]={win:0,loss:0}
+tickWindow[s]=0
 
 })
 
@@ -84,7 +84,30 @@ if(h.length<500)return
 for(let i=0;i<10;i++)drought[symbol][i]++
 drought[symbol][digit]=0
 
-if(signals[symbol]&&Date.now()<signals[symbol].expiry)return
+const sig=signals[symbol]
+
+if(sig){
+
+tickWindow[symbol]--
+
+if(sig.stage==="WAIT ENTRY" && digit===sig.entry){
+
+sig.stage="TRADE NOW"
+sig.tradeDigit=digit
+tickWindow[symbol]=1
+return
+
+}
+
+if(tickWindow[symbol]<=0){
+
+sig.stage="EXPIRED"
+
+}
+
+}
+
+if(sig && sig.stage!=="EXPIRED")return
 
 let bestDigit=0
 let bestScore=0
@@ -93,7 +116,7 @@ for(let i=0;i<10;i++){
 
 const droughtScore=drought[symbol][i]
 
-const rarity=(0.1-(freq[symbol][i]/h.length))*120
+const rarity=(0.1-(freq[symbol][i]/h.length))*100
 
 let transitionScore=0
 
@@ -101,19 +124,18 @@ if(prev!==undefined){
 
 const total=transitions[symbol][prev].reduce((a,b)=>a+b,0)
 
-if(total>50){
+if(total>30){
 
 const prob=transitions[symbol][prev][i]/total
 
-transitionScore=prob*100
+transitionScore=prob*80
 
 }
 
 }
 
 let pressure=0
-
-if(streak[symbol]>=4&&i===digit)pressure=60
+if(streak[symbol]>=4 && i===digit)pressure=60
 
 const score=droughtScore+rarity+transitionScore+pressure
 
@@ -128,58 +150,42 @@ bestDigit=i
 
 const entry=(bestDigit+3)%10
 
-let stage="SCANNING"
-
-if(bestScore>60)stage="FORMING"
-if(bestScore>90)stage="READY"
-if(bestScore>120)stage="ENTER"
-
 signals[symbol]={
 
 match:bestDigit,
 entry:entry,
-strength:Math.min(99,Math.floor(bestScore)),
-stage:stage,
-expiry:Date.now()+SIGNAL_WINDOW
+stage:"WAIT ENTRY",
+strength:Math.min(99,Math.floor(bestScore))
 
 }
+
+tickWindow[symbol]=ENTRY_TICKS
 
 })
 
 app.get("/signals",(req,res)=>{
 
-const now=Date.now()
-
 const markets=[]
 
-Object.keys(lastPrice).forEach(symbol=>{
+symbols.forEach(symbol=>{
 
 const s=signals[symbol]
-
-const expires=s?Math.max(0,Math.floor((s.expiry-now)/1000)):0
 
 markets.push({
 
 symbol,
 price:lastPrice[symbol],
-digit:lastDigit[symbol],
+last:lastDigit[symbol],
 match:s?s.match:"-",
 entry:s?s.entry:"-",
-strength:s?s.strength:0,
 stage:s?s.stage:"SCANNING",
-expires
+window:tickWindow[symbol]
 
 })
 
 })
 
-let best=null
-
-markets.forEach(m=>{
-if(!best||m.strength>best.strength)best=m
-})
-
-res.json({markets,best:best?best.symbol:null})
+res.json({markets})
 
 })
 
@@ -191,7 +197,7 @@ res.send(`
 
 <head>
 
-<title>Deriv AI Analyzer</title>
+<title>Deriv Tick Analyzer</title>
 
 <style>
 
@@ -218,14 +224,7 @@ padding:20px;
 background:#1e293b;
 border-radius:14px;
 padding:20px;
-box-shadow:0 0 15px #000;
-
-}
-
-.best{
-
-border:2px solid #22c55e;
-box-shadow:0 0 25px #22c55e;
+box-shadow:0 0 10px black;
 
 }
 
@@ -243,9 +242,16 @@ margin-bottom:10px;
 
 }
 
+.last{
+
+font-size:32px;
+margin:10px 0;
+
+}
+
 .match{
 
-font-size:40px;
+font-size:28px;
 font-weight:bold;
 
 }
@@ -253,20 +259,17 @@ font-weight:bold;
 .entry{
 
 color:#22c55e;
-margin-top:5px;
 
 }
 
 .stage{
 
 margin-top:10px;
-font-size:12px;
 
 }
 
-.timer{
+.window{
 
-margin-top:5px;
 color:#fbbf24;
 
 }
@@ -277,7 +280,7 @@ color:#fbbf24;
 
 <body>
 
-<h1>DERIV AI DIGIT ANALYZER</h1>
+<h1>DERIV TICK ANALYZER</h1>
 
 <div class="grid" id="grid"></div>
 
@@ -294,23 +297,23 @@ grid.innerHTML=""
 
 data.markets.forEach(m=>{
 
-const best=m.symbol===data.best?"card best":"card"
-
 grid.innerHTML+=\`
 
-<div class="\${best}">
+<div class="card">
 
 <div class="price">\${m.price||"-"}</div>
 
 <div class="market">\${m.symbol}</div>
 
-<div class="match">\${m.match}</div>
+<div class="last">Last Digit: \${m.last}</div>
 
-<div class="entry">entry digit \${m.entry}</div>
+<div class="match">Match: \${m.match}</div>
+
+<div class="entry">Entry Digit: \${m.entry}</div>
 
 <div class="stage">\${m.stage}</div>
 
-<div class="timer">\${m.expires}s</div>
+<div class="window">\${m.window} ticks</div>
 
 </div>
 
@@ -322,7 +325,7 @@ grid.innerHTML+=\`
 
 load()
 
-setInterval(load,2000)
+setInterval(load,1000)
 
 </script>
 
@@ -336,6 +339,6 @@ setInterval(load,2000)
 
 app.listen(PORT,()=>{
 
-console.log("AI Analyzer running on",PORT)
+console.log("Tick analyzer running")
 
 })
