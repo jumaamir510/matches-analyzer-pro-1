@@ -18,13 +18,21 @@ const history = {}
 const transitions = {}
 const lastDigit = {}
 const lastPrice = {}
+
 const entryState = {}
 const signals = {}
+const performance = {}
 
 symbols.forEach(s=>{
   history[s]=[]
   transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
   entryState[s]=null
+
+  performance[s]={
+    wins:0,
+    losses:0,
+    last:[] // last 20 results
+  }
 })
 
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
@@ -35,7 +43,7 @@ ws.on("open", ()=>{
   })
 })
 
-ws.on("message", (msg)=>{
+ws.on("message",(msg)=>{
 
   const data = JSON.parse(msg)
   if(!data.tick) return
@@ -59,9 +67,9 @@ ws.on("message", (msg)=>{
 
   if(h.length<30) return
 
-  let best = null
+  let best=null
 
-  // FIND BEST ENTRY → MATCH PAIR
+  // FIND BEST SEQUENCE
   for(let entry=0;entry<10;entry++){
 
     const row = transitions[symbol][entry]
@@ -74,13 +82,10 @@ ws.on("message", (msg)=>{
       const prob = row[match]/total
 
       if(prob >= MIN_PROB){
-
         if(!best || prob > best.prob){
-          best = {entry, match, prob}
+          best={entry,match,prob}
         }
-
       }
-
     }
   }
 
@@ -89,23 +94,23 @@ ws.on("message", (msg)=>{
     return
   }
 
-  // HANDLE ENTRY STATE
   let state = entryState[symbol]
 
+  // WAIT ENTRY
   if(!state){
 
     signals[symbol]={
-      entry: best.entry,
-      match: best.match,
-      status: "WAIT ENTRY",
-      strength: Math.floor(best.prob*100),
-      valid: "-"
+      entry:best.entry,
+      match:best.match,
+      status:"WAIT ENTRY",
+      strength:Math.floor(best.prob*100),
+      valid:"-"
     }
 
     if(digit === best.entry){
       entryState[symbol]={
-        match: best.match,
-        ticks: CONFIRM_TICKS
+        match:best.match,
+        ticks:CONFIRM_TICKS
       }
     }
 
@@ -117,12 +122,19 @@ ws.on("message", (msg)=>{
 
   if(digit === state.match){
 
+    // WIN
+    performance[symbol].wins++
+    performance[symbol].last.push("W")
+
+    if(performance[symbol].last.length>20)
+      performance[symbol].last.shift()
+
     signals[symbol]={
-      entry: best.entry,
-      match: state.match,
-      status: "TRADE NOW",
-      strength: 100,
-      valid: "NOW"
+      entry:best.entry,
+      match:state.match,
+      status:"TRADE NOW",
+      strength:100,
+      valid:"NOW"
     }
 
     entryState[symbol]=null
@@ -131,12 +143,19 @@ ws.on("message", (msg)=>{
 
   if(state.ticks <= 0){
 
+    // LOSS
+    performance[symbol].losses++
+    performance[symbol].last.push("L")
+
+    if(performance[symbol].last.length>20)
+      performance[symbol].last.shift()
+
     signals[symbol]={
-      entry: best.entry,
-      match: state.match,
-      status: "EXPIRED",
-      strength: 0,
-      valid: "0"
+      entry:best.entry,
+      match:state.match,
+      status:"EXPIRED",
+      strength:0,
+      valid:"0"
     }
 
     entryState[symbol]=null
@@ -144,35 +163,49 @@ ws.on("message", (msg)=>{
   }
 
   signals[symbol]={
-    entry: best.entry,
-    match: state.match,
-    status: "WAIT CONFIRM",
-    strength: 80,
-    valid: state.ticks + " ticks"
+    entry:best.entry,
+    match:state.match,
+    status:"WAIT CONFIRM",
+    strength:80,
+    valid:state.ticks+" ticks"
   }
 
 })
 
 app.get("/signals",(req,res)=>{
 
-  let maxStrength = 0
+  let maxStrength=0
 
   const markets = symbols.map(symbol=>{
-    const s = signals[symbol]
 
-    if(s && s.strength > maxStrength){
-      maxStrength = s.strength
+    const s = signals[symbol]
+    const perf = performance[symbol]
+
+    const total = perf.wins + perf.losses
+    const accuracy = total>0 ? Math.floor((perf.wins/total)*100) : 0
+
+    if(s && s.strength>maxStrength){
+      maxStrength=s.strength
     }
 
     return {
       symbol,
       price:lastPrice[symbol],
       last:lastDigit[symbol],
-      ...s
+      ...s,
+      accuracy,
+      wins:perf.wins,
+      losses:perf.losses,
+      lastResults:perf.last.join(" ")
     }
+
   })
 
+  // disable weak markets
   markets.forEach(m=>{
+    if(m.accuracy < 55 && (m.wins + m.losses) >= 10){
+      m.disabled = true
+    }
     m.best = m.strength === maxStrength && maxStrength > 0
   })
 
@@ -188,16 +221,17 @@ res.send(`
 <head>
 <style>
 body{background:#0f172a;color:white;font-family:Arial;text-align:center}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;padding:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;padding:20px}
 .card{background:#1e293b;padding:20px;border-radius:12px}
 .best{border:2px solid #22c55e;box-shadow:0 0 15px #22c55e}
-.signal{font-size:30px;font-weight:bold}
+.bad{opacity:0.3}
+.signal{font-size:28px;font-weight:bold}
 </style>
 </head>
 
 <body>
 
-<h1>SNIPER SEQUENCE ENGINE</h1>
+<h1>VERIFIED SIGNAL ENGINE</h1>
 
 <div class="grid" id="grid"></div>
 
@@ -215,7 +249,7 @@ data.markets.forEach(m=>{
 
 grid.innerHTML+=\`
 
-<div class="card \${m.best?"best":""}">
+<div class="card \${m.best?"best":""} \${m.disabled?"bad":""}">
 
 <div>\${m.price||"-"}</div>
 <div>\${m.symbol}</div>
@@ -228,7 +262,13 @@ grid.innerHTML+=\`
 
 <div>\${m.status||"WAIT"}</div>
 
-<div>\${m.valid||""}</div>
+<div>Valid: \${m.valid||""}</div>
+
+<hr>
+
+<div>Accuracy: \${m.accuracy}%</div>
+<div>W/L: \${m.wins}/\${m.losses}</div>
+<div>\${m.lastResults}</div>
 
 </div>
 
@@ -250,4 +290,4 @@ setInterval(load,1000)
 
 })
 
-app.listen(PORT,()=>console.log("Sniper engine running"))
+app.listen(PORT,()=>console.log("Verified engine running"))
