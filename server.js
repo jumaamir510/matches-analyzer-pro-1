@@ -10,30 +10,32 @@ const symbols = [
 ]
 
 const MEMORY = 50
+const CONFIRM_TICKS = 3
+const MIN_TRANSITIONS = 30
+const MIN_PROB = 0.35
 
 const history = {}
 const transitions = {}
-const streak = {}
 const lastDigit = {}
 const lastPrice = {}
+const entryState = {}
+const signals = {}
 
-let signals = {}
-
-symbols.forEach(s => {
-  history[s] = []
-  transitions[s] = Array.from({length:10},()=>Array(10).fill(0))
-  streak[s] = 0
+symbols.forEach(s=>{
+  history[s]=[]
+  transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
+  entryState[s]=null
 })
 
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
 
-ws.on("open", () => {
-  symbols.forEach(symbol => {
+ws.on("open", ()=>{
+  symbols.forEach(symbol=>{
     ws.send(JSON.stringify({ticks:symbol,subscribe:1}))
   })
 })
 
-ws.on("message", (msg) => {
+ws.on("message", (msg)=>{
 
   const data = JSON.parse(msg)
   if(!data.tick) return
@@ -42,155 +44,160 @@ ws.on("message", (msg) => {
   const price = data.tick.quote
   const digit = parseInt(price.toFixed(2).slice(-1))
 
-  lastPrice[symbol] = price
+  lastPrice[symbol]=price
 
   const prev = lastDigit[symbol]
-  lastDigit[symbol] = digit
+  lastDigit[symbol]=digit
 
-  if(prev !== undefined){
-
+  if(prev!==undefined){
     transitions[symbol][prev][digit]++
-
-    if(prev === digit) streak[symbol]++
-    else streak[symbol] = 1
-
   }
 
   const h = history[symbol]
   h.push(digit)
+  if(h.length>MEMORY) h.shift()
 
-  if(h.length > MEMORY){
-    h.shift()
-  }
+  if(h.length<30) return
 
-  if(h.length < 20) return
+  let best = null
 
-  let bestDigit = null
-  let bestScore = 0
-  let validity = 0
+  // FIND BEST ENTRY → MATCH PAIR
+  for(let entry=0;entry<10;entry++){
 
-  // TRANSITION LOGIC
-  if(prev !== undefined){
-
-    const row = transitions[symbol][prev]
+    const row = transitions[symbol][entry]
     const total = row.reduce((a,b)=>a+b,0)
 
-    if(total > 10){
+    if(total < MIN_TRANSITIONS) continue
 
-      for(let i=0;i<10;i++){
+    for(let match=0;match<10;match++){
 
-        const prob = row[i]/total
+      const prob = row[match]/total
 
-        if(prob > bestScore){
-          bestScore = prob
-          bestDigit = i
+      if(prob >= MIN_PROB){
+
+        if(!best || prob > best.prob){
+          best = {entry, match, prob}
         }
 
       }
 
-      if(bestScore > 0.25){
-
-        signals[symbol] = {
-          type: "TRANSITION",
-          digit: bestDigit,
-          strength: Math.floor(bestScore * 100),
-          valid: Math.floor(bestScore * 10)
-        }
-
-        return
-      }
     }
   }
 
-  // PRESSURE BREAK LOGIC
-  if(streak[symbol] >= 4){
+  if(!best){
+    signals[symbol]=null
+    return
+  }
 
-    signals[symbol] = {
-      type: "PRESSURE BREAK",
-      digit: digit, // avoid this digit
-      strength: 80,
-      valid: 4
+  // HANDLE ENTRY STATE
+  let state = entryState[symbol]
+
+  if(!state){
+
+    signals[symbol]={
+      entry: best.entry,
+      match: best.match,
+      status: "WAIT ENTRY",
+      strength: Math.floor(best.prob*100),
+      valid: "-"
+    }
+
+    if(digit === best.entry){
+      entryState[symbol]={
+        match: best.match,
+        ticks: CONFIRM_TICKS
+      }
     }
 
     return
   }
 
-  signals[symbol] = null
+  // WAIT CONFIRM
+  state.ticks--
+
+  if(digit === state.match){
+
+    signals[symbol]={
+      entry: best.entry,
+      match: state.match,
+      status: "TRADE NOW",
+      strength: 100,
+      valid: "NOW"
+    }
+
+    entryState[symbol]=null
+    return
+  }
+
+  if(state.ticks <= 0){
+
+    signals[symbol]={
+      entry: best.entry,
+      match: state.match,
+      status: "EXPIRED",
+      strength: 0,
+      valid: "0"
+    }
+
+    entryState[symbol]=null
+    return
+  }
+
+  signals[symbol]={
+    entry: best.entry,
+    match: state.match,
+    status: "WAIT CONFIRM",
+    strength: 80,
+    valid: state.ticks + " ticks"
+  }
 
 })
 
-app.get("/signals", (req,res)=>{
+app.get("/signals",(req,res)=>{
 
-  const markets = symbols.map(symbol => {
+  let maxStrength = 0
 
+  const markets = symbols.map(symbol=>{
     const s = signals[symbol]
 
-    return {
-
-      symbol,
-      price: lastPrice[symbol],
-      last: lastDigit[symbol],
-      signal: s ? s.digit : "-",
-      type: s ? s.type : "WAIT",
-      strength: s ? s.strength : 0,
-      valid: s ? s.valid : 0
-
+    if(s && s.strength > maxStrength){
+      maxStrength = s.strength
     }
 
+    return {
+      symbol,
+      price:lastPrice[symbol],
+      last:lastDigit[symbol],
+      ...s
+    }
+  })
+
+  markets.forEach(m=>{
+    m.best = m.strength === maxStrength && maxStrength > 0
   })
 
   res.json({markets})
 
 })
 
-app.get("/", (req,res)=>{
+app.get("/",(req,res)=>{
 
 res.send(`
 
 <html>
-
 <head>
-
-<title>Deriv Micro Engine</title>
-
 <style>
-
-body{
-background:#0f172a;
-color:white;
-font-family:Arial;
-text-align:center;
-}
-
-.grid{
-display:grid;
-grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
-gap:20px;
-padding:20px;
-}
-
-.card{
-background:#1e293b;
-padding:20px;
-border-radius:12px;
-}
-
-.last{
-font-size:30px;
-}
-
-.signal{
-font-size:35px;
-font-weight:bold;
-}
-
+body{background:#0f172a;color:white;font-family:Arial;text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;padding:20px}
+.card{background:#1e293b;padding:20px;border-radius:12px}
+.best{border:2px solid #22c55e;box-shadow:0 0 15px #22c55e}
+.signal{font-size:30px;font-weight:bold}
 </style>
-
 </head>
 
 <body>
 
-<h1>DERIV MICRO ENGINE</h1>
+<h1>SNIPER SEQUENCE ENGINE</h1>
 
 <div class="grid" id="grid"></div>
 
@@ -198,30 +205,30 @@ font-weight:bold;
 
 async function load(){
 
-const res = await fetch("/signals")
-const data = await res.json()
+const res=await fetch("/signals")
+const data=await res.json()
 
-const grid = document.getElementById("grid")
-grid.innerHTML = ""
+const grid=document.getElementById("grid")
+grid.innerHTML=""
 
-data.markets.forEach(m => {
+data.markets.forEach(m=>{
 
-grid.innerHTML += \`
+grid.innerHTML+=\`
 
-<div class="card">
+<div class="card \${m.best?"best":""}">
 
-<div>\${m.price || "-"}</div>
+<div>\${m.price||"-"}</div>
 <div>\${m.symbol}</div>
 
-<div class="last">Last: \${m.last}</div>
+<div>Last: \${m.last||"-"}</div>
 
-<div class="signal">\${m.signal}</div>
+<div class="signal">\${m.match||"-"}</div>
 
-<div>\${m.type}</div>
+<div>Entry: \${m.entry||"-"}</div>
 
-<div>Strength: \${m.strength}%</div>
+<div>\${m.status||"WAIT"}</div>
 
-<div>Valid: ~\${m.valid} ticks</div>
+<div>\${m.valid||""}</div>
 
 </div>
 
@@ -237,13 +244,10 @@ setInterval(load,1000)
 </script>
 
 </body>
-
 </html>
 
 `)
 
 })
 
-app.listen(PORT, ()=>{
-console.log("Micro engine running")
-})
+app.listen(PORT,()=>console.log("Sniper engine running"))
