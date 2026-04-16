@@ -11,7 +11,7 @@ const symbols = [
 
 const MEMORY = 50
 const CONFIRM_TICKS = 3
-const MIN_TRANSITIONS = 30
+const MIN_TRANSITIONS = 25
 const MIN_PROB = 0.35
 
 const history = {}
@@ -31,7 +31,7 @@ symbols.forEach(s=>{
   performance[s]={
     wins:0,
     losses:0,
-    last:[] // last 20 results
+    last:[]
   }
 })
 
@@ -65,11 +65,10 @@ ws.on("message",(msg)=>{
   h.push(digit)
   if(h.length>MEMORY) h.shift()
 
-  if(h.length<30) return
+  if(h.length < 30) return
 
   let best=null
 
-  // FIND BEST SEQUENCE
   for(let entry=0;entry<10;entry++){
 
     const row = transitions[symbol][entry]
@@ -96,7 +95,6 @@ ws.on("message",(msg)=>{
 
   let state = entryState[symbol]
 
-  // WAIT ENTRY
   if(!state){
 
     signals[symbol]={
@@ -117,17 +115,13 @@ ws.on("message",(msg)=>{
     return
   }
 
-  // WAIT CONFIRM
   state.ticks--
 
   if(digit === state.match){
 
-    // WIN
     performance[symbol].wins++
     performance[symbol].last.push("W")
-
-    if(performance[symbol].last.length>20)
-      performance[symbol].last.shift()
+    if(performance[symbol].last.length>20) performance[symbol].last.shift()
 
     signals[symbol]={
       entry:best.entry,
@@ -143,12 +137,9 @@ ws.on("message",(msg)=>{
 
   if(state.ticks <= 0){
 
-    // LOSS
     performance[symbol].losses++
     performance[symbol].last.push("L")
-
-    if(performance[symbol].last.length>20)
-      performance[symbol].last.shift()
+    if(performance[symbol].last.length>20) performance[symbol].last.shift()
 
     signals[symbol]={
       entry:best.entry,
@@ -172,122 +163,127 @@ ws.on("message",(msg)=>{
 
 })
 
-app.get("/signals",(req,res)=>{
+app.get("/analyze",(req,res)=>{
 
-  let maxStrength=0
+  const market = req.query.market
 
-  const markets = symbols.map(symbol=>{
+  if(!market) return res.json({error:"No market"})
 
-    const s = signals[symbol]
-    const perf = performance[symbol]
+  const s = signals[market]
+  const perf = performance[market]
 
-    const total = perf.wins + perf.losses
-    const accuracy = total>0 ? Math.floor((perf.wins/total)*100) : 0
+  if(!s) return res.json({signal:null})
 
-    if(s && s.strength>maxStrength){
-      maxStrength=s.strength
-    }
+  const total = perf.wins + perf.losses
+  const accuracy = total>0 ? Math.floor((perf.wins/total)*100) : 0
 
-    return {
-      symbol,
-      price:lastPrice[symbol],
-      last:lastDigit[symbol],
-      ...s,
-      accuracy,
-      wins:perf.wins,
-      losses:perf.losses,
-      lastResults:perf.last.join(" ")
-    }
+  if(accuracy < 55 && total >= 10){
+    return res.json({signal:null})
+  }
 
+  res.json({
+    market,
+    price:lastPrice[market],
+    last:lastDigit[market],
+    entry:s.entry,
+    match:s.match,
+    status:s.status,
+    valid:s.valid,
+    accuracy,
+    wins:perf.wins,
+    losses:perf.losses,
+    signal:true
   })
-
-  // disable weak markets
-  markets.forEach(m=>{
-    if(m.accuracy < 55 && (m.wins + m.losses) >= 10){
-      m.disabled = true
-    }
-    m.best = m.strength === maxStrength && maxStrength > 0
-  })
-
-  res.json({markets})
 
 })
 
 app.get("/",(req,res)=>{
 
 res.send(`
-
 <html>
 <head>
 <style>
 body{background:#0f172a;color:white;font-family:Arial;text-align:center}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;padding:20px}
-.card{background:#1e293b;padding:20px;border-radius:12px}
-.best{border:2px solid #22c55e;box-shadow:0 0 15px #22c55e}
-.bad{opacity:0.3}
-.signal{font-size:28px;font-weight:bold}
+.container{padding:20px}
+select,button{padding:10px;margin:10px;border-radius:8px;border:none}
+.result{margin-top:20px;background:#1e293b;padding:20px;border-radius:12px}
+.big{font-size:28px;font-weight:bold}
 </style>
 </head>
 
 <body>
 
-<h1>VERIFIED SIGNAL ENGINE</h1>
+<h1>DERIV ANALYZE MODE</h1>
 
-<div class="grid" id="grid"></div>
+<div class="container">
 
-<script>
+<select id="market">
+<option value="">-- Select Market --</option>
+<option value="R_10">R_10</option>
+<option value="R_25">R_25</option>
+<option value="R_50">R_50</option>
+<option value="R_75">R_75</option>
+<option value="R_100">R_100</option>
+<option value="1HZ10V">1HZ10V</option>
+<option value="1HZ25V">1HZ25V</option>
+<option value="1HZ50V">1HZ50V</option>
+<option value="1HZ75V">1HZ75V</option>
+<option value="1HZ100V">1HZ100V</option>
+</select>
 
-async function load(){
+<br>
 
-const res=await fetch("/signals")
-const data=await res.json()
+<button onclick="analyze()">ANALYZE</button>
 
-const grid=document.getElementById("grid")
-grid.innerHTML=""
-
-data.markets.forEach(m=>{
-
-grid.innerHTML+=\`
-
-<div class="card \${m.best?"best":""} \${m.disabled?"bad":""}">
-
-<div>\${m.price||"-"}</div>
-<div>\${m.symbol}</div>
-
-<div>Last: \${m.last||"-"}</div>
-
-<div class="signal">\${m.match||"-"}</div>
-
-<div>Entry: \${m.entry||"-"}</div>
-
-<div>\${m.status||"WAIT"}</div>
-
-<div>Valid: \${m.valid||""}</div>
-
-<hr>
-
-<div>Accuracy: \${m.accuracy}%</div>
-<div>W/L: \${m.wins}/\${m.losses}</div>
-<div>\${m.lastResults}</div>
+<div id="output" class="result"></div>
 
 </div>
 
-\`
+<script>
 
-})
+async function analyze(){
 
+const market=document.getElementById("market").value
+
+if(!market){
+  alert("Select market")
+  return
 }
 
-load()
-setInterval(load,1000)
+const res = await fetch("/analyze?market="+market)
+const data = await res.json()
+
+const o=document.getElementById("output")
+
+if(!data.signal){
+  o.innerHTML="<div>No trade setup right now</div>"
+  return
+}
+
+o.innerHTML=\`
+<div>\${data.price}</div>
+<div>\${data.market}</div>
+
+<div>Last Digit: \${data.last}</div>
+
+<div class="big">\${data.match}</div>
+<div>Entry: \${data.entry}</div>
+
+<div>Status: \${data.status}</div>
+<div>Valid: \${data.valid}</div>
+
+<hr>
+
+<div>Accuracy: \${data.accuracy}%</div>
+<div>W/L: \${data.wins}/\${data.losses}</div>
+\`
+}
 
 </script>
 
 </body>
 </html>
-
 `)
-
 })
 
-app.listen(PORT,()=>console.log("Verified engine running"))
+app.listen(PORT,()=>console.log("Analyze engine running"))
