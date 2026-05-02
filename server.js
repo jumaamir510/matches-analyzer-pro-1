@@ -9,30 +9,21 @@ const symbols = [
 "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
 ]
 
-const MEMORY = 50
-const CONFIRM_TICKS = 3
-const MIN_TRANSITIONS = 25
-const MIN_PROB = 0.35
+const MEMORY = 40
+const SHORT_MEMORY = 12
+const MIN_TRANSITIONS = 15
+const MIN_PROB = 0.3
 
 const history = {}
+const shortHistory = {}
 const transitions = {}
 const lastDigit = {}
 const lastPrice = {}
 
-const entryState = {}
-const signals = {}
-const performance = {}
-
 symbols.forEach(s=>{
   history[s]=[]
+  shortHistory[s]=[]
   transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
-  entryState[s]=null
-
-  performance[s]={
-    wins:0,
-    losses:0,
-    last:[]
-  }
 })
 
 const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
@@ -52,232 +43,218 @@ ws.on("message",(msg)=>{
   const price = data.tick.quote
   const digit = parseInt(price.toFixed(2).slice(-1))
 
-  lastPrice[symbol]=price
+  lastPrice[symbol] = price
 
   const prev = lastDigit[symbol]
-  lastDigit[symbol]=digit
+  lastDigit[symbol] = digit
 
-  if(prev!==undefined){
+  if(prev !== undefined){
     transitions[symbol][prev][digit]++
   }
 
+  // long memory
   const h = history[symbol]
   h.push(digit)
-  if(h.length>MEMORY) h.shift()
+  if(h.length > MEMORY) h.shift()
 
-  if(h.length < 30) return
-
-  let best=null
-
-  for(let entry=0;entry<10;entry++){
-
-    const row = transitions[symbol][entry]
-    const total = row.reduce((a,b)=>a+b,0)
-
-    if(total < MIN_TRANSITIONS) continue
-
-    for(let match=0;match<10;match++){
-
-      const prob = row[match]/total
-
-      if(prob >= MIN_PROB){
-        if(!best || prob > best.prob){
-          best={entry,match,prob}
-        }
-      }
-    }
-  }
-
-  if(!best){
-    signals[symbol]=null
-    return
-  }
-
-  let state = entryState[symbol]
-
-  if(!state){
-
-    signals[symbol]={
-      entry:best.entry,
-      match:best.match,
-      status:"WAIT ENTRY",
-      strength:Math.floor(best.prob*100),
-      valid:"-"
-    }
-
-    if(digit === best.entry){
-      entryState[symbol]={
-        match:best.match,
-        ticks:CONFIRM_TICKS
-      }
-    }
-
-    return
-  }
-
-  state.ticks--
-
-  if(digit === state.match){
-
-    performance[symbol].wins++
-    performance[symbol].last.push("W")
-    if(performance[symbol].last.length>20) performance[symbol].last.shift()
-
-    signals[symbol]={
-      entry:best.entry,
-      match:state.match,
-      status:"TRADE NOW",
-      strength:100,
-      valid:"NOW"
-    }
-
-    entryState[symbol]=null
-    return
-  }
-
-  if(state.ticks <= 0){
-
-    performance[symbol].losses++
-    performance[symbol].last.push("L")
-    if(performance[symbol].last.length>20) performance[symbol].last.shift()
-
-    signals[symbol]={
-      entry:best.entry,
-      match:state.match,
-      status:"EXPIRED",
-      strength:0,
-      valid:"0"
-    }
-
-    entryState[symbol]=null
-    return
-  }
-
-  signals[symbol]={
-    entry:best.entry,
-    match:state.match,
-    status:"WAIT CONFIRM",
-    strength:80,
-    valid:state.ticks+" ticks"
-  }
+  // short memory
+  const sh = shortHistory[symbol]
+  sh.push(digit)
+  if(sh.length > SHORT_MEMORY) sh.shift()
 
 })
 
+
+// 🔥 CORE: FIND BEST SIGNAL ACROSS ALL MARKETS
+function getBestSignal(){
+
+  let bestGlobal = null
+
+  symbols.forEach(symbol=>{
+
+    const h = history[symbol]
+    const sh = shortHistory[symbol]
+
+    if(h.length < 20) return
+
+    let bestLocal = null
+
+    for(let entry=0; entry<10; entry++){
+
+      const row = transitions[symbol][entry]
+      const total = row.reduce((a,b)=>a+b,0)
+
+      if(total < MIN_TRANSITIONS) continue
+
+      for(let match=0; match<10; match++){
+
+        const prob = row[match] / total
+
+        // short-term validation
+        let shortCount = 0
+        let shortTotal = 0
+
+        for(let i=1;i<sh.length;i++){
+          if(sh[i-1] === entry){
+            shortTotal++
+            if(sh[i] === match) shortCount++
+          }
+        }
+
+        const shortProb = shortTotal > 0 ? shortCount / shortTotal : 0
+
+        if(prob >= MIN_PROB && shortProb >= 0.25){
+
+          const score = (prob * 0.7) + (shortProb * 0.3)
+
+          if(!bestLocal || score > bestLocal.score){
+            bestLocal = {
+              symbol,
+              entry,
+              match,
+              score,
+              prob,
+              shortProb
+            }
+          }
+        }
+      }
+    }
+
+    if(bestLocal){
+      if(!bestGlobal || bestLocal.score > bestGlobal.score){
+        bestGlobal = bestLocal
+      }
+    }
+
+  })
+
+  return bestGlobal
+}
+
+
+// 🔥 ANALYZE ROUTE
 app.get("/analyze",(req,res)=>{
 
-  const market = req.query.market
+  const best = getBestSignal()
 
-  if(!market) return res.json({error:"No market"})
-
-  const s = signals[market]
-  const perf = performance[market]
-
-  if(!s) return res.json({signal:null})
-
-  const total = perf.wins + perf.losses
-  const accuracy = total>0 ? Math.floor((perf.wins/total)*100) : 0
-
-  if(accuracy < 55 && total >= 10){
+  if(!best){
     return res.json({signal:null})
   }
 
+  // dynamic expiry (stronger = longer validity)
+  const expiry = Math.max(3, Math.floor(best.score * 10))
+
   res.json({
-    market,
-    price:lastPrice[market],
-    last:lastDigit[market],
-    entry:s.entry,
-    match:s.match,
-    status:s.status,
-    valid:s.valid,
-    accuracy,
-    wins:perf.wins,
-    losses:perf.losses,
-    signal:true
+    market: best.symbol,
+    match: best.match,
+    entry: best.entry,
+    price: lastPrice[best.symbol],
+    strength: Math.floor(best.score * 100),
+    expires: expiry
   })
 
 })
 
+
+// 🔥 UI (SINGLE BIG CARD)
 app.get("/",(req,res)=>{
 
 res.send(`
 <html>
 <head>
 <style>
-body{background:#0f172a;color:white;font-family:Arial;text-align:center}
-.container{padding:20px}
-select,button{padding:10px;margin:10px;border-radius:8px;border:none}
-.result{margin-top:20px;background:#1e293b;padding:20px;border-radius:12px}
-.big{font-size:28px;font-weight:bold}
+body{
+  background: radial-gradient(circle at top, #0f172a, #020617);
+  color:white;
+  font-family:Arial;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  height:100vh;
+}
+
+.card{
+  width:320px;
+  padding:30px;
+  border-radius:20px;
+  background:linear-gradient(145deg,#1e293b,#0f172a);
+  box-shadow:0 0 30px rgba(0,255,150,0.3);
+  text-align:center;
+}
+
+.market{
+  font-size:18px;
+  opacity:0.8;
+}
+
+.digit{
+  font-size:80px;
+  font-weight:bold;
+  margin:20px 0;
+  color:#22c55e;
+}
+
+.timer{
+  font-size:22px;
+  margin-top:10px;
+}
+
+.btn{
+  margin-top:20px;
+  padding:10px 20px;
+  border:none;
+  border-radius:10px;
+  background:#22c55e;
+  color:black;
+  font-weight:bold;
+  cursor:pointer;
+}
 </style>
 </head>
 
 <body>
 
-<h1>DERIV ANALYZE MODE</h1>
+<div class="card">
 
-<div class="container">
+<div class="market" id="market">--</div>
 
-<select id="market">
-<option value="">-- Select Market --</option>
-<option value="R_10">R_10</option>
-<option value="R_25">R_25</option>
-<option value="R_50">R_50</option>
-<option value="R_75">R_75</option>
-<option value="R_100">R_100</option>
-<option value="1HZ10V">1HZ10V</option>
-<option value="1HZ25V">1HZ25V</option>
-<option value="1HZ50V">1HZ50V</option>
-<option value="1HZ75V">1HZ75V</option>
-<option value="1HZ100V">1HZ100V</option>
-</select>
+<div class="digit" id="digit">-</div>
 
-<br>
+<div class="timer" id="timer">--</div>
 
-<button onclick="analyze()">ANALYZE</button>
-
-<div id="output" class="result"></div>
+<button class="btn" onclick="analyze()">ANALYZE</button>
 
 </div>
 
 <script>
 
+let countdown = 0
+
 async function analyze(){
 
-const market=document.getElementById("market").value
+  const res = await fetch("/analyze")
+  const data = await res.json()
 
-if(!market){
-  alert("Select market")
-  return
+  if(!data.signal && !data.market){
+    document.getElementById("digit").innerText = "-"
+    document.getElementById("market").innerText = "No signal"
+    document.getElementById("timer").innerText = ""
+    return
+  }
+
+  document.getElementById("market").innerText = data.market
+  document.getElementById("digit").innerText = data.match
+
+  countdown = data.expires
 }
 
-const res = await fetch("/analyze?market="+market)
-const data = await res.json()
-
-const o=document.getElementById("output")
-
-if(!data.signal){
-  o.innerHTML="<div>No trade setup right now</div>"
-  return
-}
-
-o.innerHTML=\`
-<div>\${data.price}</div>
-<div>\${data.market}</div>
-
-<div>Last Digit: \${data.last}</div>
-
-<div class="big">\${data.match}</div>
-<div>Entry: \${data.entry}</div>
-
-<div>Status: \${data.status}</div>
-<div>Valid: \${data.valid}</div>
-
-<hr>
-
-<div>Accuracy: \${data.accuracy}%</div>
-<div>W/L: \${data.wins}/\${data.losses}</div>
-\`
-}
+setInterval(()=>{
+  if(countdown > 0){
+    countdown--
+    document.getElementById("timer").innerText = countdown + " ticks"
+  }
+},1000)
 
 </script>
 
@@ -286,4 +263,4 @@ o.innerHTML=\`
 `)
 })
 
-app.listen(PORT,()=>console.log("Analyze engine running"))
+app.listen(PORT,()=>console.log("Sniper engine running"))
