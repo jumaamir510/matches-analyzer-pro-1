@@ -4,18 +4,40 @@ const WebSocket = require("ws")
 const app = express()
 const PORT = process.env.PORT || 10000
 
+// ======================
+// MARKETS
+// ======================
+
 const symbols = [
-"R_10","R_25","R_50","R_75","R_100",
-"1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
+  "R_10",
+  "R_25",
+  "R_50",
+  "R_75",
+  "R_100",
+  "1HZ10V",
+  "1HZ25V",
+  "1HZ50V",
+  "1HZ75V",
+  "1HZ100V"
 ]
 
-const MEMORY = 50
-const SHORT_MEMORY = 15
+// ======================
+// FAST + STABLE ENGINE
+// ======================
 
-// SIGNAL SETTINGS
-const SIGNAL_LIFETIME = 5000 // 5 seconds
-const MIN_TRANSITIONS = 25
-const MIN_PROB = 0.35
+const MEMORY = 40
+const SHORT_MEMORY = 20
+
+const MIN_TRANSITIONS = 7
+const MIN_PROB = 0.24
+const MIN_STABILITY = 0.35
+
+const PRESSURE_WEIGHT = 0.75
+const STABILITY_WEIGHT = 0.25
+
+// ======================
+// STORAGE
+// ======================
 
 const history = {}
 const shortHistory = {}
@@ -24,30 +46,42 @@ const transitions = {}
 const lastDigit = {}
 const lastPrice = {}
 
-const entryState = {}
-const signals = {}
-const performance = {}
+let bestSignal = null
 
-symbols.forEach(symbol=>{
+symbols.forEach(symbol => {
 
   history[symbol] = []
   shortHistory[symbol] = []
 
   transitions[symbol] =
-    Array.from({length:10},()=>Array(10).fill(0))
-
-  entryState[symbol] = null
-
-  performance[symbol] = {
-    wins:0,
-    losses:0,
-    last:[]
-  }
+    Array.from({ length:10 }, () =>
+      Array(10).fill(0)
+    )
 
 })
 
-const ws = new WebSocket(
-  "wss://ws.derivws.com/websockets/v3?app_id=1089"
+// ======================
+// DYNAMIC EXPIRY
+// ======================
+
+function dynamicExpiry(score){
+
+  if(score >= 0.90) return 14
+  if(score >= 0.80) return 12
+  if(score >= 0.70) return 10
+  if(score >= 0.60) return 8
+  if(score >= 0.50) return 6
+
+  return 5
+}
+
+// ======================
+// DERIV WS
+// ======================
+
+const ws =
+new WebSocket(
+"wss://ws.derivws.com/websockets/v3?app_id=1089"
 )
 
 ws.on("open",()=>{
@@ -65,6 +99,10 @@ ws.on("open",()=>{
 
 })
 
+// ======================
+// LIVE ENGINE
+// ======================
+
 ws.on("message",(msg)=>{
 
   const data = JSON.parse(msg)
@@ -75,83 +113,89 @@ ws.on("message",(msg)=>{
   const price = data.tick.quote
 
   const digit =
-    parseInt(price.toFixed(2).slice(-1))
+  parseInt(
+    price.toFixed(2).slice(-1)
+  )
 
   lastPrice[symbol] = price
 
   const prev = lastDigit[symbol]
   lastDigit[symbol] = digit
 
+  // ======================
   // BUILD TRANSITIONS
+  // ======================
+
   if(prev !== undefined){
 
     transitions[symbol][prev][digit]++
 
   }
 
-  // LONG MEMORY
+  // ======================
+  // HISTORY
+  // ======================
+
   const h = history[symbol]
 
   h.push(digit)
 
   if(h.length > MEMORY){
-
     h.shift()
-
   }
 
-  // SHORT MEMORY
   const sh = shortHistory[symbol]
 
   sh.push(digit)
 
   if(sh.length > SHORT_MEMORY){
-
     sh.shift()
-
   }
 
-  // WAIT UNTIL ENOUGH DATA EXISTS
-  if(h.length < 30){
+  // fast startup
 
+  if(h.length < 12){
     return
-
   }
 
-  let best = null
+  let localBest = null
 
-  // ANALYZE TRANSITIONS
+  // ======================
+  // ANALYSIS
+  // ======================
+
   for(let entry=0; entry<10; entry++){
 
-    const row = transitions[symbol][entry]
+    const row =
+    transitions[symbol][entry]
 
     const total =
-      row.reduce((a,b)=>a+b,0)
+    row.reduce((a,b)=>a+b,0)
 
     if(total < MIN_TRANSITIONS){
-
       continue
-
     }
 
     for(let match=0; match<10; match++){
 
-      const prob = row[match] / total
+      const prob =
+      row[match] / total
 
-      // SHORT TERM VALIDATION
+      // ======================
+      // SHORT TERM STABILITY
+      // ======================
+
       let shortCount = 0
       let shortTotal = 0
 
-      for(let i=1; i<sh.length; i++){
+      for(let i=1;i<sh.length;i++){
 
         if(sh[i-1] === entry){
 
           shortTotal++
 
           if(sh[i] === match){
-
             shortCount++
-
           }
 
         }
@@ -159,31 +203,67 @@ ws.on("message",(msg)=>{
       }
 
       const shortProb =
-        shortTotal > 0
-          ? shortCount / shortTotal
-          : 0
+      shortTotal > 0
+      ? shortCount / shortTotal
+      : 0
 
-      // REQUIRE BOTH LONG + SHORT CONFIDENCE
       if(
         prob >= MIN_PROB &&
-        shortProb >= 0.25
+        shortProb >= MIN_STABILITY
       ){
 
-        const score =
-          (prob * 0.7) +
-          (shortProb * 0.3)
+        const baseScore =
+        (prob * PRESSURE_WEIGHT) +
+        (shortProb * STABILITY_WEIGHT)
+
+        // ======================
+        // LIVE PRESSURE
+        // ======================
+
+        const recent =
+        h.slice(-8)
+
+        let pressureCount = 0
+
+        for(let i=0;i<recent.length-1;i++){
+
+          if(
+            recent[i] === entry &&
+            recent[i+1] === match
+          ){
+            pressureCount++
+          }
+
+        }
+
+        const liveBoost =
+        pressureCount / 8
+
+        const finalScore =
+        baseScore + (liveBoost * 0.15)
 
         if(
-          !best ||
-          score > best.score
+          !localBest ||
+          finalScore > localBest.score
         ){
 
-          best = {
+          localBest = {
+
+            market:symbol,
+
+            price,
+
             entry,
+
             match,
-            prob,
-            shortProb,
-            score
+
+            last:digit,
+
+            score:finalScore,
+
+            strength:
+            Math.floor(finalScore * 100)
+
           }
 
         }
@@ -194,218 +274,112 @@ ws.on("message",(msg)=>{
 
   }
 
-  // NO VALID SETUP
-  if(!best){
-
-    signals[symbol] = null
+  if(!localBest){
     return
-
   }
 
-  let state = entryState[symbol]
+  // ======================
+  // GLOBAL BEST SIGNAL
+  // ======================
 
-  // WAITING FOR ENTRY DIGIT
-  if(!state){
+  const expiry =
+  dynamicExpiry(localBest.score)
 
-    signals[symbol] = {
+  bestSignal = {
 
-      entry:best.entry,
-      match:best.match,
+    ...localBest,
 
-      status:"WAIT ENTRY",
-
-      strength:
-        Math.floor(best.score * 100),
-
-      valid:"Waiting...",
-
-      shortProb:best.shortProb
-
-    }
-
-    // ENTRY TOUCHED
-    if(digit === best.entry){
-
-      entryState[symbol] = {
-
-        match:best.match,
-
-        expires:
-          Date.now() + SIGNAL_LIFETIME
-
-      }
-
-    }
-
-    return
-
-  }
-
-  // MATCH HIT
-  if(digit === state.match){
-
-    performance[symbol].wins++
-
-    performance[symbol].last.push("W")
-
-    if(
-      performance[symbol].last.length > 20
-    ){
-
-      performance[symbol].last.shift()
-
-    }
-
-    signals[symbol] = {
-
-      entry:best.entry,
-      match:state.match,
-
-      status:"TRADE NOW",
-
-      strength:100,
-
-      valid:"NOW",
-
-      shortProb:best.shortProb
-
-    }
-
-    entryState[symbol] = null
-
-    return
-
-  }
-
-  // SIGNAL EXPIRED
-  if(Date.now() > state.expires){
-
-    performance[symbol].losses++
-
-    performance[symbol].last.push("L")
-
-    if(
-      performance[symbol].last.length > 20
-    ){
-
-      performance[symbol].last.shift()
-
-    }
-
-    signals[symbol] = {
-
-      entry:best.entry,
-      match:state.match,
-
-      status:"EXPIRED",
-
-      strength:0,
-
-      valid:"0s",
-
-      shortProb:0
-
-    }
-
-    entryState[symbol] = null
-
-    return
-
-  }
-
-  // WAITING FOR MATCH
-  signals[symbol] = {
-
-    entry:best.entry,
-    match:state.match,
-
-    status:"WAIT CONFIRM",
-
-    strength:80,
-
-    valid:
-      Math.max(
-        0,
-        Math.floor(
-          (state.expires - Date.now()) / 1000
-        )
-      ) + "s",
-
-    shortProb:best.shortProb
+    expiry,
+    created:Date.now()
 
   }
 
 })
 
-// ANALYZE ROUTE
-app.get("/analyze",(req,res)=>{
+// ======================
+// AUTO REFRESH
+// ======================
 
-  const market = req.query.market
+setInterval(()=>{
 
-  if(!market){
+  if(!bestSignal) return
+
+  const elapsed =
+  Math.floor(
+    (Date.now() - bestSignal.created)
+    / 1000
+  )
+
+  const remaining =
+  bestSignal.expiry - elapsed
+
+  if(remaining <= 0){
+
+    bestSignal = null
+
+  }
+
+},1000)
+
+// ======================
+// API
+// ======================
+
+app.get("/best",(req,res)=>{
+
+  if(!bestSignal){
 
     return res.json({
-      error:"No market selected"
+      active:false
     })
 
   }
 
-  const s = signals[market]
+  const elapsed =
+  Math.floor(
+    (Date.now() - bestSignal.created)
+    / 1000
+  )
 
-  const perf = performance[market]
+  const remaining =
+  bestSignal.expiry - elapsed
 
-  if(!s){
+  if(remaining <= 0){
+
+    bestSignal = null
 
     return res.json({
-      signal:null
+      active:false
     })
 
   }
-
-  const total =
-    perf.wins + perf.losses
-
-  const accuracy =
-    total > 0
-      ? Math.floor(
-          (perf.wins / total) * 100
-        )
-      : 0
 
   res.json({
 
-    signal:true,
+    active:true,
 
-    market,
+    market:bestSignal.market,
 
-    price:lastPrice[market],
+    price:bestSignal.price,
 
-    last:lastDigit[market],
+    last:bestSignal.last,
 
-    entry:s.entry,
+    entry:bestSignal.entry,
 
-    match:s.match,
+    match:bestSignal.match,
 
-    status:s.status,
+    strength:bestSignal.strength,
 
-    valid:s.valid,
-
-    accuracy,
-
-    stability:
-      Math.floor(
-        (s.shortProb || 0) * 100
-      ),
-
-    wins:perf.wins,
-
-    losses:perf.losses
+    remaining
 
   })
 
 })
 
-// FRONTEND
+// ======================
+// HUGE GLOW UI
+// ======================
+
 app.get("/",(req,res)=>{
 
 res.send(`
@@ -414,63 +388,302 @@ res.send(`
 
 <head>
 
-<title>Deriv Analyze Engine</title>
+<title>
+DERIV AI ENGINE
+</title>
 
 <style>
 
+*{
+margin:0;
+padding:0;
+box-sizing:border-box;
+font-family:Arial;
+}
+
 body{
 
-  background:#0f172a;
-  color:white;
-  font-family:Arial;
-  text-align:center;
-  padding:30px;
+height:100vh;
+
+display:flex;
+justify-content:center;
+align-items:center;
+
+background:
+radial-gradient(
+circle at top,
+#111827,
+#020617
+);
+
+overflow:hidden;
+
+color:white;
 
 }
 
-select,button{
+.glow1{
 
-  padding:12px;
-  margin:10px;
-  border:none;
-  border-radius:10px;
-  font-size:16px;
+position:absolute;
+
+width:800px;
+height:800px;
+
+background:#22c55e;
+
+filter:blur(220px);
+
+opacity:0.18;
+
+border-radius:50%;
+
+top:-250px;
+right:-250px;
+
+animation:float 10s ease-in-out infinite;
 
 }
 
-button{
+.glow2{
 
-  cursor:pointer;
+position:absolute;
+
+width:700px;
+height:700px;
+
+background:#3b82f6;
+
+filter:blur(220px);
+
+opacity:0.15;
+
+border-radius:50%;
+
+bottom:-250px;
+left:-250px;
+
+animation:float2 12s ease-in-out infinite;
+
+}
+
+@keyframes float{
+
+0%{
+transform:translateY(0px)
+}
+
+50%{
+transform:translateY(40px)
+}
+
+100%{
+transform:translateY(0px)
+}
+
+}
+
+@keyframes float2{
+
+0%{
+transform:translateY(0px)
+}
+
+50%{
+transform:translateY(-40px)
+}
+
+100%{
+transform:translateY(0px)
+}
 
 }
 
 .card{
 
-  margin:auto;
-  margin-top:20px;
+position:relative;
 
-  background:#1e293b;
+z-index:10;
 
-  width:320px;
+width:560px;
+height:760px;
 
-  border-radius:15px;
+background:
+rgba(15,23,42,0.78);
 
-  padding:20px;
+border:
+1px solid rgba(255,255,255,0.08);
+
+backdrop-filter:blur(30px);
+
+border-radius:40px;
+
+padding:40px;
+
+display:flex;
+flex-direction:column;
+justify-content:space-between;
+align-items:center;
+
+box-shadow:
+0 0 60px rgba(0,0,0,0.45);
 
 }
 
-.big{
+.market{
 
-  font-size:55px;
-  font-weight:bold;
-  margin:15px 0;
+font-size:34px;
+font-weight:bold;
+
+color:#cbd5e1;
+
+letter-spacing:3px;
+
+text-align:center;
+
+margin-top:10px;
 
 }
 
-.status{
+.price{
 
-  font-size:22px;
-  margin-top:10px;
+font-size:28px;
+
+color:#94a3b8;
+
+margin-top:15px;
+
+}
+
+.label{
+
+font-size:16px;
+
+letter-spacing:4px;
+
+color:#64748b;
+
+margin-top:25px;
+
+}
+
+.digit{
+
+font-size:240px;
+font-weight:900;
+
+line-height:1;
+
+margin-top:10px;
+
+background:
+linear-gradient(
+180deg,
+#ffffff,
+#22c55e
+);
+
+-webkit-background-clip:text;
+-webkit-text-fill-color:transparent;
+
+text-shadow:
+0 0 40px rgba(34,197,94,0.45);
+
+}
+
+.timer{
+
+font-size:80px;
+font-weight:900;
+
+margin-top:15px;
+
+color:#f8fafc;
+
+}
+
+.timerSub{
+
+font-size:16px;
+
+color:#94a3b8;
+
+margin-top:8px;
+
+}
+
+.footer{
+
+width:100%;
+
+display:flex;
+justify-content:space-between;
+
+margin-top:25px;
+
+}
+
+.box{
+
+flex:1;
+
+margin:8px;
+
+padding:25px;
+
+background:
+rgba(255,255,255,0.05);
+
+border-radius:25px;
+
+text-align:center;
+
+}
+
+.boxTitle{
+
+font-size:14px;
+
+letter-spacing:2px;
+
+color:#94a3b8;
+
+margin-bottom:10px;
+
+}
+
+.boxValue{
+
+font-size:44px;
+font-weight:bold;
+
+}
+
+.wait{
+
+font-size:40px;
+font-weight:bold;
+
+color:#22c55e;
+
+margin-top:30px;
+
+animation:pulse 1.5s infinite;
+
+}
+
+@keyframes pulse{
+
+0%{
+opacity:0.5
+}
+
+50%{
+opacity:1
+}
+
+100%{
+opacity:0.5
+}
 
 }
 
@@ -480,151 +693,181 @@ button{
 
 <body>
 
-<h1>DERIV ANALYZE ENGINE</h1>
+<div class="glow1"></div>
+<div class="glow2"></div>
 
-<select id="market">
+<div class="card">
 
-<option value="">Select Market</option>
+<div
+class="market"
+id="market"
+>
 
-<option value="R_10">R_10</option>
-<option value="R_25">R_25</option>
-<option value="R_50">R_50</option>
-<option value="R_75">R_75</option>
-<option value="R_100">R_100</option>
+SCANNING MARKET...
 
-<option value="1HZ10V">1HZ10V</option>
-<option value="1HZ25V">1HZ25V</option>
-<option value="1HZ50V">1HZ50V</option>
-<option value="1HZ75V">1HZ75V</option>
-<option value="1HZ100V">1HZ100V</option>
+</div>
 
-</select>
+<div
+class="price"
+id="price"
+>
 
-<br>
+WAITING FOR LIVE DATA
 
-<button onclick="analyze()">
-ANALYZE
-</button>
+</div>
 
-<div id="output"></div>
+<div>
+
+<div class="label">
+MATCH DIGIT
+</div>
+
+<div
+class="digit"
+id="digit"
+>
+
+-
+
+</div>
+
+</div>
+
+<div>
+
+<div
+class="timer"
+id="timer"
+>
+
+--
+
+</div>
+
+<div class="timerSub">
+SIGNAL VALIDITY
+</div>
+
+</div>
+
+<div class="footer">
+
+<div class="box">
+
+<div class="boxTitle">
+ENTRY
+</div>
+
+<div
+class="boxValue"
+id="entry"
+>
+
+-
+
+</div>
+
+</div>
+
+<div class="box">
+
+<div class="boxTitle">
+STRENGTH
+</div>
+
+<div
+class="boxValue"
+id="strength"
+>
+
+0%
+
+</div>
+
+</div>
+
+</div>
+
+<div
+class="wait"
+id="status"
+>
+
+ANALYZING...
+
+</div>
+
+</div>
 
 <script>
 
-let selectedMarket = ""
+async function load(){
 
-setInterval(()=>{
+try{
 
-  if(selectedMarket){
+const res =
+await fetch("/best")
 
-    analyze()
+const data =
+await res.json()
 
-  }
+if(!data.active){
 
-},1000)
+document
+.getElementById("status")
+.innerText =
+"SCANNING..."
 
-async function analyze(){
-
-  const market =
-    document.getElementById("market").value
-
-  selectedMarket = market
-
-  if(!market){
-
-    return
-
-  }
-
-  const res =
-    await fetch(
-      "/analyze?market=" + market
-    )
-
-  const data = await res.json()
-
-  const output =
-    document.getElementById("output")
-
-  if(!data.signal){
-
-    output.innerHTML = \`
-      <div class="card">
-        No trade setup right now
-      </div>
-    \`
-
-    return
-
-  }
-
-  output.innerHTML = \`
-
-  <div class="card">
-
-    <div>
-      <b>\${data.market}</b>
-    </div>
-
-    <br>
-
-    <div>
-      Price:
-      \${data.price}
-    </div>
-
-    <div>
-      Last Digit:
-      \${data.last}
-    </div>
-
-    <hr>
-
-    <div>
-      MATCH DIGIT
-    </div>
-
-    <div class="big">
-      \${data.match}
-    </div>
-
-    <div>
-      Entry Digit:
-      <b>\${data.entry}</b>
-    </div>
-
-    <br>
-
-    <div class="status">
-      \${data.status}
-    </div>
-
-    <div>
-      Valid:
-      \${data.valid}
-    </div>
-
-    <hr>
-
-    <div>
-      Accuracy:
-      \${data.accuracy}%
-    </div>
-
-    <div>
-      Stability:
-      \${data.stability}%
-    </div>
-
-    <div>
-      W/L:
-      \${data.wins}/\${data.losses}
-    </div>
-
-  </div>
-
-  \`
+return
 
 }
+
+document
+.getElementById("market")
+.innerText =
+data.market
+
+document
+.getElementById("price")
+.innerText =
+"LIVE PRICE: " + data.price
+
+document
+.getElementById("digit")
+.innerText =
+data.match
+
+document
+.getElementById("entry")
+.innerText =
+data.entry
+
+document
+.getElementById("strength")
+.innerText =
+data.strength + "%"
+
+document
+.getElementById("timer")
+.innerText =
+data.remaining + "s"
+
+document
+.getElementById("status")
+.innerText =
+"ENTER NOW"
+
+}catch(err){
+
+console.log(err)
+
+}
+
+}
+
+// FAST REFRESH
+
+setInterval(load,500)
 
 </script>
 
@@ -633,12 +876,17 @@ async function analyze(){
 </html>
 
 `)
+
 })
+
+// ======================
+// START SERVER
+// ======================
 
 app.listen(PORT,()=>{
 
-  console.log(
-    "Deriv Analyze Engine running..."
-  )
+console.log(
+"DERIV AI ENGINE RUNNING"
+)
 
 })
