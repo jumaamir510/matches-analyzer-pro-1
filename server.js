@@ -9,258 +9,636 @@ const symbols = [
 "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V"
 ]
 
-const MEMORY = 40
-const SHORT_MEMORY = 12
-const MIN_TRANSITIONS = 15
-const MIN_PROB = 0.3
+const MEMORY = 50
+const SHORT_MEMORY = 15
+
+// SIGNAL SETTINGS
+const SIGNAL_LIFETIME = 5000 // 5 seconds
+const MIN_TRANSITIONS = 25
+const MIN_PROB = 0.35
 
 const history = {}
 const shortHistory = {}
 const transitions = {}
+
 const lastDigit = {}
 const lastPrice = {}
 
-symbols.forEach(s=>{
-  history[s]=[]
-  shortHistory[s]=[]
-  transitions[s]=Array.from({length:10},()=>Array(10).fill(0))
+const entryState = {}
+const signals = {}
+const performance = {}
+
+symbols.forEach(symbol=>{
+
+  history[symbol] = []
+  shortHistory[symbol] = []
+
+  transitions[symbol] =
+    Array.from({length:10},()=>Array(10).fill(0))
+
+  entryState[symbol] = null
+
+  performance[symbol] = {
+    wins:0,
+    losses:0,
+    last:[]
+  }
+
 })
 
-const ws = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089")
+const ws = new WebSocket(
+  "wss://ws.derivws.com/websockets/v3?app_id=1089"
+)
 
-ws.on("open", ()=>{
+ws.on("open",()=>{
+
+  console.log("Connected to Deriv")
+
   symbols.forEach(symbol=>{
-    ws.send(JSON.stringify({ticks:symbol,subscribe:1}))
+
+    ws.send(JSON.stringify({
+      ticks:symbol,
+      subscribe:1
+    }))
+
   })
+
 })
 
 ws.on("message",(msg)=>{
 
   const data = JSON.parse(msg)
+
   if(!data.tick) return
 
   const symbol = data.tick.symbol
   const price = data.tick.quote
-  const digit = parseInt(price.toFixed(2).slice(-1))
+
+  const digit =
+    parseInt(price.toFixed(2).slice(-1))
 
   lastPrice[symbol] = price
 
   const prev = lastDigit[symbol]
   lastDigit[symbol] = digit
 
+  // BUILD TRANSITIONS
   if(prev !== undefined){
+
     transitions[symbol][prev][digit]++
+
   }
 
-  // long memory
+  // LONG MEMORY
   const h = history[symbol]
-  h.push(digit)
-  if(h.length > MEMORY) h.shift()
 
-  // short memory
+  h.push(digit)
+
+  if(h.length > MEMORY){
+
+    h.shift()
+
+  }
+
+  // SHORT MEMORY
   const sh = shortHistory[symbol]
+
   sh.push(digit)
-  if(sh.length > SHORT_MEMORY) sh.shift()
+
+  if(sh.length > SHORT_MEMORY){
+
+    sh.shift()
+
+  }
+
+  // WAIT UNTIL ENOUGH DATA EXISTS
+  if(h.length < 30){
+
+    return
+
+  }
+
+  let best = null
+
+  // ANALYZE TRANSITIONS
+  for(let entry=0; entry<10; entry++){
+
+    const row = transitions[symbol][entry]
+
+    const total =
+      row.reduce((a,b)=>a+b,0)
+
+    if(total < MIN_TRANSITIONS){
+
+      continue
+
+    }
+
+    for(let match=0; match<10; match++){
+
+      const prob = row[match] / total
+
+      // SHORT TERM VALIDATION
+      let shortCount = 0
+      let shortTotal = 0
+
+      for(let i=1; i<sh.length; i++){
+
+        if(sh[i-1] === entry){
+
+          shortTotal++
+
+          if(sh[i] === match){
+
+            shortCount++
+
+          }
+
+        }
+
+      }
+
+      const shortProb =
+        shortTotal > 0
+          ? shortCount / shortTotal
+          : 0
+
+      // REQUIRE BOTH LONG + SHORT CONFIDENCE
+      if(
+        prob >= MIN_PROB &&
+        shortProb >= 0.25
+      ){
+
+        const score =
+          (prob * 0.7) +
+          (shortProb * 0.3)
+
+        if(
+          !best ||
+          score > best.score
+        ){
+
+          best = {
+            entry,
+            match,
+            prob,
+            shortProb,
+            score
+          }
+
+        }
+
+      }
+
+    }
+
+  }
+
+  // NO VALID SETUP
+  if(!best){
+
+    signals[symbol] = null
+    return
+
+  }
+
+  let state = entryState[symbol]
+
+  // WAITING FOR ENTRY DIGIT
+  if(!state){
+
+    signals[symbol] = {
+
+      entry:best.entry,
+      match:best.match,
+
+      status:"WAIT ENTRY",
+
+      strength:
+        Math.floor(best.score * 100),
+
+      valid:"Waiting...",
+
+      shortProb:best.shortProb
+
+    }
+
+    // ENTRY TOUCHED
+    if(digit === best.entry){
+
+      entryState[symbol] = {
+
+        match:best.match,
+
+        expires:
+          Date.now() + SIGNAL_LIFETIME
+
+      }
+
+    }
+
+    return
+
+  }
+
+  // MATCH HIT
+  if(digit === state.match){
+
+    performance[symbol].wins++
+
+    performance[symbol].last.push("W")
+
+    if(
+      performance[symbol].last.length > 20
+    ){
+
+      performance[symbol].last.shift()
+
+    }
+
+    signals[symbol] = {
+
+      entry:best.entry,
+      match:state.match,
+
+      status:"TRADE NOW",
+
+      strength:100,
+
+      valid:"NOW",
+
+      shortProb:best.shortProb
+
+    }
+
+    entryState[symbol] = null
+
+    return
+
+  }
+
+  // SIGNAL EXPIRED
+  if(Date.now() > state.expires){
+
+    performance[symbol].losses++
+
+    performance[symbol].last.push("L")
+
+    if(
+      performance[symbol].last.length > 20
+    ){
+
+      performance[symbol].last.shift()
+
+    }
+
+    signals[symbol] = {
+
+      entry:best.entry,
+      match:state.match,
+
+      status:"EXPIRED",
+
+      strength:0,
+
+      valid:"0s",
+
+      shortProb:0
+
+    }
+
+    entryState[symbol] = null
+
+    return
+
+  }
+
+  // WAITING FOR MATCH
+  signals[symbol] = {
+
+    entry:best.entry,
+    match:state.match,
+
+    status:"WAIT CONFIRM",
+
+    strength:80,
+
+    valid:
+      Math.max(
+        0,
+        Math.floor(
+          (state.expires - Date.now()) / 1000
+        )
+      ) + "s",
+
+    shortProb:best.shortProb
+
+  }
 
 })
 
-
-// 🔥 CORE: FIND BEST SIGNAL ACROSS ALL MARKETS
-function getBestSignal(){
-
-  let bestGlobal = null
-
-  symbols.forEach(symbol=>{
-
-    const h = history[symbol]
-    const sh = shortHistory[symbol]
-
-    if(h.length < 20) return
-
-    let bestLocal = null
-
-    for(let entry=0; entry<10; entry++){
-
-      const row = transitions[symbol][entry]
-      const total = row.reduce((a,b)=>a+b,0)
-
-      if(total < MIN_TRANSITIONS) continue
-
-      for(let match=0; match<10; match++){
-
-        const prob = row[match] / total
-
-        // short-term validation
-        let shortCount = 0
-        let shortTotal = 0
-
-        for(let i=1;i<sh.length;i++){
-          if(sh[i-1] === entry){
-            shortTotal++
-            if(sh[i] === match) shortCount++
-          }
-        }
-
-        const shortProb = shortTotal > 0 ? shortCount / shortTotal : 0
-
-        if(prob >= MIN_PROB && shortProb >= 0.25){
-
-          const score = (prob * 0.7) + (shortProb * 0.3)
-
-          if(!bestLocal || score > bestLocal.score){
-            bestLocal = {
-              symbol,
-              entry,
-              match,
-              score,
-              prob,
-              shortProb
-            }
-          }
-        }
-      }
-    }
-
-    if(bestLocal){
-      if(!bestGlobal || bestLocal.score > bestGlobal.score){
-        bestGlobal = bestLocal
-      }
-    }
-
-  })
-
-  return bestGlobal
-}
-
-
-// 🔥 ANALYZE ROUTE
+// ANALYZE ROUTE
 app.get("/analyze",(req,res)=>{
 
-  const best = getBestSignal()
+  const market = req.query.market
 
-  if(!best){
-    return res.json({signal:null})
+  if(!market){
+
+    return res.json({
+      error:"No market selected"
+    })
+
   }
 
-  // dynamic expiry (stronger = longer validity)
-  const expiry = Math.max(3, Math.floor(best.score * 10))
+  const s = signals[market]
+
+  const perf = performance[market]
+
+  if(!s){
+
+    return res.json({
+      signal:null
+    })
+
+  }
+
+  const total =
+    perf.wins + perf.losses
+
+  const accuracy =
+    total > 0
+      ? Math.floor(
+          (perf.wins / total) * 100
+        )
+      : 0
 
   res.json({
-    market: best.symbol,
-    match: best.match,
-    entry: best.entry,
-    price: lastPrice[best.symbol],
-    strength: Math.floor(best.score * 100),
-    expires: expiry
+
+    signal:true,
+
+    market,
+
+    price:lastPrice[market],
+
+    last:lastDigit[market],
+
+    entry:s.entry,
+
+    match:s.match,
+
+    status:s.status,
+
+    valid:s.valid,
+
+    accuracy,
+
+    stability:
+      Math.floor(
+        (s.shortProb || 0) * 100
+      ),
+
+    wins:perf.wins,
+
+    losses:perf.losses
+
   })
 
 })
 
-
-// 🔥 UI (SINGLE BIG CARD)
+// FRONTEND
 app.get("/",(req,res)=>{
 
 res.send(`
+
 <html>
+
 <head>
+
+<title>Deriv Analyze Engine</title>
+
 <style>
+
 body{
-  background: radial-gradient(circle at top, #0f172a, #020617);
+
+  background:#0f172a;
   color:white;
   font-family:Arial;
-  display:flex;
-  justify-content:center;
-  align-items:center;
-  height:100vh;
+  text-align:center;
+  padding:30px;
+
+}
+
+select,button{
+
+  padding:12px;
+  margin:10px;
+  border:none;
+  border-radius:10px;
+  font-size:16px;
+
+}
+
+button{
+
+  cursor:pointer;
+
 }
 
 .card{
+
+  margin:auto;
+  margin-top:20px;
+
+  background:#1e293b;
+
   width:320px;
-  padding:30px;
-  border-radius:20px;
-  background:linear-gradient(145deg,#1e293b,#0f172a);
-  box-shadow:0 0 30px rgba(0,255,150,0.3);
-  text-align:center;
+
+  border-radius:15px;
+
+  padding:20px;
+
 }
 
-.market{
-  font-size:18px;
-  opacity:0.8;
-}
+.big{
 
-.digit{
-  font-size:80px;
+  font-size:55px;
   font-weight:bold;
-  margin:20px 0;
-  color:#22c55e;
+  margin:15px 0;
+
 }
 
-.timer{
+.status{
+
   font-size:22px;
   margin-top:10px;
+
 }
 
-.btn{
-  margin-top:20px;
-  padding:10px 20px;
-  border:none;
-  border-radius:10px;
-  background:#22c55e;
-  color:black;
-  font-weight:bold;
-  cursor:pointer;
-}
 </style>
+
 </head>
 
 <body>
 
-<div class="card">
+<h1>DERIV ANALYZE ENGINE</h1>
 
-<div class="market" id="market">--</div>
+<select id="market">
 
-<div class="digit" id="digit">-</div>
+<option value="">Select Market</option>
 
-<div class="timer" id="timer">--</div>
+<option value="R_10">R_10</option>
+<option value="R_25">R_25</option>
+<option value="R_50">R_50</option>
+<option value="R_75">R_75</option>
+<option value="R_100">R_100</option>
 
-<button class="btn" onclick="analyze()">ANALYZE</button>
+<option value="1HZ10V">1HZ10V</option>
+<option value="1HZ25V">1HZ25V</option>
+<option value="1HZ50V">1HZ50V</option>
+<option value="1HZ75V">1HZ75V</option>
+<option value="1HZ100V">1HZ100V</option>
 
-</div>
+</select>
+
+<br>
+
+<button onclick="analyze()">
+ANALYZE
+</button>
+
+<div id="output"></div>
 
 <script>
 
-let countdown = 0
+let selectedMarket = ""
+
+setInterval(()=>{
+
+  if(selectedMarket){
+
+    analyze()
+
+  }
+
+},1000)
 
 async function analyze(){
 
-  const res = await fetch("/analyze")
+  const market =
+    document.getElementById("market").value
+
+  selectedMarket = market
+
+  if(!market){
+
+    return
+
+  }
+
+  const res =
+    await fetch(
+      "/analyze?market=" + market
+    )
+
   const data = await res.json()
 
-  if(!data.signal && !data.market){
-    document.getElementById("digit").innerText = "-"
-    document.getElementById("market").innerText = "No signal"
-    document.getElementById("timer").innerText = ""
+  const output =
+    document.getElementById("output")
+
+  if(!data.signal){
+
+    output.innerHTML = \`
+      <div class="card">
+        No trade setup right now
+      </div>
+    \`
+
     return
+
   }
 
-  document.getElementById("market").innerText = data.market
-  document.getElementById("digit").innerText = data.match
+  output.innerHTML = \`
 
-  countdown = data.expires
+  <div class="card">
+
+    <div>
+      <b>\${data.market}</b>
+    </div>
+
+    <br>
+
+    <div>
+      Price:
+      \${data.price}
+    </div>
+
+    <div>
+      Last Digit:
+      \${data.last}
+    </div>
+
+    <hr>
+
+    <div>
+      MATCH DIGIT
+    </div>
+
+    <div class="big">
+      \${data.match}
+    </div>
+
+    <div>
+      Entry Digit:
+      <b>\${data.entry}</b>
+    </div>
+
+    <br>
+
+    <div class="status">
+      \${data.status}
+    </div>
+
+    <div>
+      Valid:
+      \${data.valid}
+    </div>
+
+    <hr>
+
+    <div>
+      Accuracy:
+      \${data.accuracy}%
+    </div>
+
+    <div>
+      Stability:
+      \${data.stability}%
+    </div>
+
+    <div>
+      W/L:
+      \${data.wins}/\${data.losses}
+    </div>
+
+  </div>
+
+  \`
+
 }
-
-setInterval(()=>{
-  if(countdown > 0){
-    countdown--
-    document.getElementById("timer").innerText = countdown + " ticks"
-  }
-},1000)
 
 </script>
 
 </body>
+
 </html>
+
 `)
 })
 
-app.listen(PORT,()=>console.log("Sniper engine running"))
+app.listen(PORT,()=>{
+
+  console.log(
+    "Deriv Analyze Engine running..."
+  )
+
+})
